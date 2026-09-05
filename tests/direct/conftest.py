@@ -72,3 +72,37 @@ def _inject_message_to_fd0_tolerant(vm) -> None:
 
 
 _loader._inject_message_to_fd0 = _inject_message_to_fd0_tolerant
+
+
+# --- `warp` does not reach gl.message_raw in gltest 0.29.2 --------------------
+#
+# Block time on GenVM is `gl.message_raw["datetime"]`. gltest injects it into
+# fd 0 exactly once, in `load_contract_class`, and the SDK caches it at import.
+# `VMContext.warp` (vm.py:240) sets `vm._datetime` and calls
+# `_refresh_gl_message`, but that method (vm.py:584) only rewrites
+# `sender_address` and `origin_address` — it never touches `datetime`. So
+# without this shim `warp` moves `datetime.datetime.now()` (which gltest
+# patches in `activate`) while leaving `gl.message_raw["datetime"]` frozen at
+# deploy time, and no contract reading canonical block time can observe time
+# passing.
+#
+# ponytail: mirror the one field gltest forgot rather than reimplementing
+# `_refresh_gl_message`. Delete this block once `warp` propagates its own
+# timestamp — check that `_refresh_gl_message` assigns `datetime` before
+# assuming it is fixed.
+
+from gltest.direct.vm import VMContext as _VMContext
+
+_refresh_gl_message = _VMContext._refresh_gl_message
+
+
+def _refresh_gl_message_with_datetime(self) -> None:
+    _refresh_gl_message(self)
+    import sys
+
+    gl = sys.modules.get("genlayer.gl")
+    if gl is not None and getattr(gl, "message_raw", None) is not None:
+        gl.message_raw["datetime"] = self._datetime
+
+
+_VMContext._refresh_gl_message = _refresh_gl_message_with_datetime

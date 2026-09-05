@@ -1,5 +1,6 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
+import datetime
 import hashlib
 import json
 from dataclasses import dataclass
@@ -14,6 +15,10 @@ ERROR_LLM = "[LLM_ERROR]"
 CLAIM_KINDS = ("not_delivered", "off_spec", "overcharged", "duplicate", "sla_breach")
 OUTCOMES = ("upheld", "adjusted", "rejected")
 PRECEDENT_CAP = 5
+
+STATUS_OPEN = "open"
+STATUS_ACCEPTED = "accepted"
+STATUS_SETTLED = "settled"
 
 
 @allow_storage
@@ -56,12 +61,14 @@ class Statement:
 
 class Notch(gl.Contract):
     bond_atto: u256
+    dispute_window_seconds: u256
     tabs: TreeMap[str, Tab]
     items: TreeMap[str, LineItem]
     statements: TreeMap[str, Statement]
 
-    def __init__(self, bond_atto: u256) -> None:
+    def __init__(self, bond_atto: u256, dispute_window_seconds: u256) -> None:
         self.bond_atto = bond_atto
+        self.dispute_window_seconds = dispute_window_seconds
 
     @gl.public.view
     def get_bond_atto(self) -> int:
@@ -187,7 +194,7 @@ class Notch(gl.Contract):
         s.cycle = u256(cycle)
         s.closed_at = gl.message_raw["datetime"]
         s.statement_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        s.status = "open"
+        s.status = STATUS_OPEN
         s.settle_ref = ""
         for i in sorted(ids):
             s.notch_ids.append(i)
@@ -198,11 +205,58 @@ class Notch(gl.Contract):
 
     @gl.public.view
     def get_statement(self, statement_id: str) -> dict:
-        if statement_id not in self.statements:
-            raise gl.vm.UserError(f"{ERROR_EXPECTED} no such statement")
-        s = self.statements[statement_id]
+        s = self._statement(statement_id)
         return {"tab_id": s.tab_id, "cycle": s.cycle, "closed_at": s.closed_at,
                 "statement_hash": s.statement_hash, "status": s.status,
                 "settle_ref": s.settle_ref,
                 "legs": [json.loads(x) for x in s.legs],
                 "notch_ids": [x for x in s.notch_ids]}
+
+    def _statement(self, statement_id: str) -> Statement:
+        """Every entry point that names a statement id routes through here.
+
+        `TreeMap.__getitem__` raises a bare `KeyError()` with an empty message,
+        and spec §5 has validators compare errors by prefix — an empty one
+        matches nothing.
+        """
+        if statement_id not in self.statements:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no such statement")
+        return self.statements[statement_id]
+
+    def _is_final(self, s: Statement) -> bool:
+        if s.status in (STATUS_ACCEPTED, STATUS_SETTLED):
+            return True
+        # ponytail: the "and no dispute is open" half of the rule lands in
+        # Task 4, which is where dispute state first exists. Until then an
+        # elapsed window is the only path to auto-accept.
+        now = datetime.datetime.fromisoformat(gl.message_raw["datetime"])
+        closed = datetime.datetime.fromisoformat(s.closed_at)
+        return (now - closed).total_seconds() >= int(self.dispute_window_seconds)
+
+    @gl.public.view
+    def is_final(self, statement_id: str) -> bool:
+        return self._is_final(self._statement(statement_id))
+
+    @gl.public.write
+    def accept(self, statement_id: str) -> None:
+        s = self._statement(statement_id)
+        if not self._member(self.tabs[s.tab_id], gl.message.sender_address):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} not a member")
+        if s.status != STATUS_OPEN:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} not open")
+        s.status = STATUS_ACCEPTED
+
+    @gl.public.write
+    def file_settlement(self, statement_id: str, settle_ref: str) -> None:
+        s = self._statement(statement_id)
+        if not self._member(self.tabs[s.tab_id], gl.message.sender_address):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} not a member")
+        if s.status == STATUS_SETTLED:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} already settled")
+        # `is_final` and not `status == accepted`: an auto-accepted statement
+        # never reaches that status, and letting a stalling counterparty block
+        # the receipt would undo the whole point of the window.
+        if not self._is_final(s):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} not final")
+        s.status = STATUS_SETTLED
+        s.settle_ref = settle_ref

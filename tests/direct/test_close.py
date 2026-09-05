@@ -12,7 +12,7 @@ import json
 
 
 def _tab(direct_vm, direct_deploy, a, b):
-    c = direct_deploy("contracts/notch.py", BOND)
+    c = direct_deploy("contracts/notch.py", BOND, 3600)
     direct_vm.sender = a
     c.open_tab("t1", [hex_of(a), hex_of(b)], 86400)
     return c
