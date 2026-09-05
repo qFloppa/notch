@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+viewer/node_modules/
+viewer/.next/
+.env*
+
+# local scratch, never committed
+.superpowers/
+.remember/
+.claude/settings.local.json
