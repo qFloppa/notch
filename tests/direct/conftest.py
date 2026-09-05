@@ -10,6 +10,7 @@ import hashlib
 
 BOND = 10**18
 URI = "https://ev.test/a.json"
+URI_PATTERN = r".*ev\.test.*"   # what a mocked evidence host answers to
 H = "0" * 64
 FIVE_MILLI = 5_000_000_000_000_000  # 0.005 USDC at atto scale
 # The magnitudes real amounts live at. `str()` of a float goes exponent form at
@@ -58,6 +59,11 @@ def past_window(direct_vm, c, sid) -> None:
     assert c.get_dispute_window_seconds() == 3600
     closed = datetime.datetime.fromisoformat(c.get_statement(sid)["closed_at"])
     direct_vm.warp((closed + datetime.timedelta(seconds=3601)).isoformat())
+
+
+def _serves(direct_vm, status=200, body=BODY):
+    """What the notch's `evidence_uri` returns when the leader fetches it."""
+    direct_vm.mock_web(URI_PATTERN, {"status": status, "body": body})
 
 
 def _disputed(direct_vm, direct_deploy, a, b, evidence_hash=GOOD_H, atto=1000):
