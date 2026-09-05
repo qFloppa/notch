@@ -6,11 +6,19 @@ up is a Windows-only bug in that plugin's loader — see the bottom of this file
 """
 
 import datetime
+import hashlib
 
 BOND = 10**18
 URI = "https://ev.test/a.json"
 H = "0" * 64
 FIVE_MILLI = 5_000_000_000_000_000  # 0.005 USDC at atto scale
+
+# The evidence a notch commits to, and the hash that matches it. `H` above is
+# the opposite: a well-formed hash that matches nothing, for the tasks that
+# never fetch. Derived, never typed out — a hardcoded digest would be a second
+# copy of `BODY` that silently stops matching the first one.
+BODY = '{"text": "receipt: TOTAL 42.00"}'
+GOOD_H = hashlib.sha256(BODY.encode()).hexdigest()
 
 
 def hex_of(addr) -> str:
@@ -44,6 +52,33 @@ def past_window(direct_vm, c, sid) -> None:
     assert c.get_dispute_window_seconds() == 3600
     closed = datetime.datetime.fromisoformat(c.get_statement(sid)["closed_at"])
     direct_vm.warp((closed + datetime.timedelta(seconds=3601)).isoformat())
+
+
+def _disputed(direct_vm, direct_deploy, a, b, evidence_hash=GOOD_H, atto=1000):
+    """One notch, closed, and under dispute. `(contract, statement_id, dispute_id)`.
+
+    `a` bills and closes; `b` is the payer, so `b` is the only party who may
+    contest it. The evidence hash defaults to the one that matches `BODY`, so a
+    test that wants the mismatch short-circuit passes its own.
+
+    Returns the statement id as well as the dispute id: the statement's status
+    is what a resolution unfreezes, and reconstructing `sid` from `dispute_id`
+    by string surgery in every caller is worse than one more tuple slot.
+    """
+    c = direct_deploy("contracts/notch.py", BOND, 3600)
+    direct_vm.sender = a
+    c.open_tab("t1", [hex_of(a), hex_of(b)], 86400)
+    c.add_notch("t1", "n1", hex_of(b), atto, "return the receipt total",
+                URI, evidence_hash, "off_spec")
+    sid = c.close("t1")
+    direct_vm.sender = b
+    direct_vm.value = BOND
+    c.open_dispute(sid, ["n1"], "off_spec", "the total is wrong")
+    # Back to zero. `open_dispute` is the only payable method, and GenVM rejects
+    # value sent to a non-payable one (`_genlayer_runner.py`) while direct mode
+    # does not — a leftover value would pass here and fail on a real network.
+    direct_vm.value = 0
+    return c, sid, sid + "#d"
 
 
 # --- Windows workaround for gltest 0.29.2 direct mode -------------------------
