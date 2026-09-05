@@ -59,6 +59,8 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} tab exists")
         if len(members) < 2:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} need two members")
+        if cycle_seconds == 0:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} zero cycle")
         t = self.tabs.get_or_insert_default(tab_id)
         t.creator = gl.message.sender_address
         t.cycle_seconds = cycle_seconds
@@ -89,6 +91,12 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} unknown claim_kind")
         if atto == 0:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} zero amount")
+        # 64 lowercase hex, never normalised: hexdigest() is lowercase, so
+        # folding case here would hide a real mismatch instead of rejecting it.
+        if len(evidence_hash) != 64 or any(
+            c not in "0123456789abcdef" for c in evidence_hash
+        ):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} bad evidence_hash")
         p = Address(payer)
         if p == payee:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} payer is payee")
@@ -103,6 +111,8 @@ class Notch(gl.Contract):
 
     @gl.public.view
     def get_notch(self, notch_id: str) -> dict:
+        if notch_id not in self.items:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no such notch")
         n = self.items[notch_id]
         return {"tab_id": n.tab_id, "payer": n.payer.as_hex,
                 "payee": n.payee.as_hex, "atto": n.atto, "memo": n.memo,
@@ -111,6 +121,8 @@ class Notch(gl.Contract):
 
     @gl.public.view
     def get_tab(self, tab_id: str) -> dict:
+        if tab_id not in self.tabs:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no such tab")
         t = self.tabs[tab_id]
         return {"creator": t.creator.as_hex, "cycle": t.cycle,
                 "cycle_seconds": t.cycle_seconds, "opened_at": t.opened_at,

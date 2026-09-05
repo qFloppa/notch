@@ -32,7 +32,8 @@ def test_non_member_cannot_bill(direct_vm, direct_deploy, direct_alice,
         c.add_notch("t1", "n1", hex_of(direct_bob), 1, "x", URI, H, "off_spec")
 
 
-def test_guards(direct_vm, direct_deploy, direct_alice, direct_bob):
+def test_guards(direct_vm, direct_deploy, direct_alice, direct_bob,
+                direct_charlie):
     c = direct_deploy("contracts/notch.py", BOND)
     direct_vm.sender = direct_alice
     c.open_tab("t1", [hex_of(direct_alice), hex_of(direct_bob)], 86400)
@@ -46,3 +47,16 @@ def test_guards(direct_vm, direct_deploy, direct_alice, direct_bob):
         c.add_notch("t1", "n3", hex_of(direct_bob), 0, "x", URI, H, "off_spec")
     with direct_vm.expect_revert("[EXPECTED] payer is payee"):
         c.add_notch("t1", "n4", hex_of(direct_alice), 1, "x", URI, H, "off_spec")
+    with direct_vm.expect_revert("[EXPECTED] payer not a member"):
+        c.add_notch("t1", "n5", hex_of(direct_charlie), 1, "x", URI, H, "off_spec")
+    with direct_vm.expect_revert("[EXPECTED] bad evidence_hash"):
+        c.add_notch("t1", "n6", hex_of(direct_bob), 1, "x", URI, "", "off_spec")
+    with direct_vm.expect_revert("[EXPECTED] bad evidence_hash"):
+        c.add_notch("t1", "n7", hex_of(direct_bob), 1, "x", URI, "A" * 64,
+                    "off_spec")
+    with direct_vm.expect_revert("[EXPECTED] zero cycle"):
+        c.open_tab("t2", [hex_of(direct_alice), hex_of(direct_bob)], 0)
+    with direct_vm.expect_revert("[EXPECTED] no such notch"):
+        c.get_notch("nope")
+    with direct_vm.expect_revert("[EXPECTED] no such tab"):
+        c.get_tab("nope")

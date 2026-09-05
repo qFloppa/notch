@@ -62,7 +62,13 @@ def _inject_message_to_fd0_tolerant(vm) -> None:
     try:
         _inject_message_to_fd0(vm)
     except PermissionError:
-        pass
+        # Only the unlink is tolerable, and only once `dup2` has already landed.
+        # `vm._original_stdin_fd` is assigned at loader.py:287, immediately
+        # before the dup2, so an unset one means the failure came earlier — from
+        # `mkstemp` (:280) or `os.write` (:282) — fd 0 was never injected, and
+        # swallowing it would bury the real cause under a downstream failure.
+        if getattr(vm, "_original_stdin_fd", None) is None:
+            raise
 
 
 _loader._inject_message_to_fd0 = _inject_message_to_fd0_tolerant
