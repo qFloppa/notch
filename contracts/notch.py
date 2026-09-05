@@ -52,6 +52,7 @@ class Statement:
     tab_id: str
     cycle: u256
     closed_at: str
+    closed_by: Address
     statement_hash: str
     status: str
     settle_ref: str
@@ -67,6 +68,11 @@ class Notch(gl.Contract):
     statements: TreeMap[str, Statement]
 
     def __init__(self, bond_atto: u256, dispute_window_seconds: u256) -> None:
+        if dispute_window_seconds == 0:
+            # A zero window makes every statement final the instant it closes,
+            # so nobody could ever dispute one. `open_tab` guards the analogous
+            # `cycle_seconds == 0`.
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} zero window")
         self.bond_atto = bond_atto
         self.dispute_window_seconds = dispute_window_seconds
 
@@ -193,6 +199,7 @@ class Notch(gl.Contract):
         s.tab_id = tab_id
         s.cycle = u256(cycle)
         s.closed_at = gl.message_raw["datetime"]
+        s.closed_by = gl.message.sender_address
         s.statement_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         s.status = STATUS_OPEN
         s.settle_ref = ""
@@ -207,6 +214,7 @@ class Notch(gl.Contract):
     def get_statement(self, statement_id: str) -> dict:
         s = self._statement(statement_id)
         return {"tab_id": s.tab_id, "cycle": s.cycle, "closed_at": s.closed_at,
+                "closed_by": s.closed_by.as_hex,
                 "statement_hash": s.statement_hash, "status": s.status,
                 "settle_ref": s.settle_ref,
                 "legs": [json.loads(x) for x in s.legs],
@@ -231,7 +239,10 @@ class Notch(gl.Contract):
         # elapsed window is the only path to auto-accept.
         now = datetime.datetime.fromisoformat(gl.message_raw["datetime"])
         closed = datetime.datetime.fromisoformat(s.closed_at)
-        return (now - closed).total_seconds() >= int(self.dispute_window_seconds)
+        # timedelta comparison, not total_seconds(): the constraints forbid
+        # floats, and this is the comparison that decides finality.
+        window = datetime.timedelta(seconds=int(self.dispute_window_seconds))
+        return (now - closed) >= window
 
     @gl.public.view
     def is_final(self, statement_id: str) -> bool:
@@ -244,6 +255,11 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} not a member")
         if s.status != STATUS_OPEN:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} not open")
+        # Spec §4: accept is the *counterparty* agreeing. The closer accepting
+        # its own statement would collapse the dispute window to zero at its own
+        # discretion — this task's stall-proofing run in reverse.
+        if gl.message.sender_address == s.closed_by:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} closer cannot accept")
         s.status = STATUS_ACCEPTED
 
     @gl.public.write
@@ -253,6 +269,10 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} not a member")
         if s.status == STATUS_SETTLED:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} already settled")
+        if settle_ref == "":
+            # "" is also close()'s unset sentinel, so an empty ref would mark a
+            # statement settled with no receipt to point at.
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} empty settle_ref")
         # `is_final` and not `status == accepted`: an auto-accepted statement
         # never reaches that status, and letting a stalling counterparty block
         # the receipt would undo the whole point of the window.
