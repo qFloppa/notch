@@ -100,6 +100,10 @@ class Notch(gl.Contract):
     def get_bond_atto(self) -> int:
         return self.bond_atto
 
+    @gl.public.view
+    def get_dispute_window_seconds(self) -> int:
+        return self.dispute_window_seconds
+
     @gl.public.write
     def open_tab(self, tab_id: str, members: list[str], cycle_seconds: u256) -> None:
         if tab_id in self.tabs:
@@ -320,9 +324,10 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} already disputed")
         if s.status != STATUS_OPEN:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} not open")
-        # Disputable and final are exact complements, so this asks `_is_final`
-        # instead of recomputing the window beside it: two copies of that rule
-        # could drift into a statement that is both, or neither.
+        # `s.status == open` is guaranteed by the two guards above, and for an
+        # open statement final and disputable ARE complements — so this asks
+        # `_is_final` rather than recomputing the window beside it, where two
+        # copies of the rule could drift.
         if self._is_final(s):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} window closed")
         # The bond is native GEN, and this is the only method that custodies
@@ -359,11 +364,15 @@ class Notch(gl.Contract):
         # ponytail: one dispute per statement — the id is derived, not counted.
         # Concurrent disputes over one statement would need per-leg locking and
         # buy nothing at demo scale; a DynArray of disputes if a real user asks.
-        # Nothing can overwrite a bonded record while that holds: reaching this
-        # line requires `s.status == open`, and the assignment below leaves it
-        # `disputed` forever after. A later task that reopens a statement has to
-        # re-add the key check with it.
-        d = self.disputes.get_or_insert_default(f"{statement_id}#d")
+        dispute_id = f"{statement_id}#d"
+        # Structural, not incidental: `get_or_insert_default` would overwrite
+        # `bond_atto` and *append* to `notch_ids` on a record that already exists,
+        # losing a claimant's money with no way to recover it. The status guards
+        # above make that unreachable today, but they are a proxy for this key —
+        # so the key is checked where the money is written, not one task away.
+        if dispute_id in self.disputes:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} already disputed")
+        d = self.disputes.get_or_insert_default(dispute_id)
         d.statement_id = statement_id
         d.claimant = who
         d.claim_kind = claim_kind

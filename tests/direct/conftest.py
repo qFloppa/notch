@@ -37,9 +37,11 @@ def past_window(direct_vm, c, sid) -> None:
     """Warp just past the dispute window, relative to when the statement closed.
 
     Relative rather than a fixed future date: an absolute warp silently starts
-    testing nothing once wall-clock time passes it. The 3600 matches the window
-    every test deploys with.
+    testing nothing once wall-clock time passes it.
     """
+    # Asserted, not assumed: a test deploying a longer window would otherwise
+    # warp to a point still inside it and quietly stop testing the boundary.
+    assert c.get_dispute_window_seconds() == 3600
     closed = datetime.datetime.fromisoformat(c.get_statement(sid)["closed_at"])
     direct_vm.warp((closed + datetime.timedelta(seconds=3601)).isoformat())
 
