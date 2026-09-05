@@ -5,6 +5,8 @@ gltest's auto-registered pytest plugin. The one thing that does need wiring
 up is a Windows-only bug in that plugin's loader — see the bottom of this file.
 """
 
+import datetime
+
 BOND = 10**18
 URI = "https://ev.test/a.json"
 H = "0" * 64
@@ -29,6 +31,17 @@ def hex_of(addr) -> str:
     from genlayer.py.types import Address
 
     return Address(addr).as_hex
+
+
+def past_window(direct_vm, c, sid) -> None:
+    """Warp just past the dispute window, relative to when the statement closed.
+
+    Relative rather than a fixed future date: an absolute warp silently starts
+    testing nothing once wall-clock time passes it. The 3600 matches the window
+    every test deploys with.
+    """
+    closed = datetime.datetime.fromisoformat(c.get_statement(sid)["closed_at"])
+    direct_vm.warp((closed + datetime.timedelta(seconds=3601)).isoformat())
 
 
 # --- Windows workaround for gltest 0.29.2 direct mode -------------------------

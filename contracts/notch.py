@@ -19,6 +19,7 @@ PRECEDENT_CAP = 5
 STATUS_OPEN = "open"
 STATUS_ACCEPTED = "accepted"
 STATUS_SETTLED = "settled"
+STATUS_DISPUTED = "disputed"
 
 
 @allow_storage
@@ -60,12 +61,31 @@ class Statement:
     notch_ids: DynArray[str]
 
 
+@allow_storage
+@dataclass
+class Dispute:
+    statement_id: str
+    claimant: Address
+    claim_kind: str
+    claim: str
+    bond_atto: u256
+    status: str
+    outcome: str
+    adjusted_atto: u256
+    evidence_hash_matched: bool
+    rationale: str
+    opened_at: str
+    notch_ids: DynArray[str]
+    cited: DynArray[str]
+
+
 class Notch(gl.Contract):
     bond_atto: u256
     dispute_window_seconds: u256
     tabs: TreeMap[str, Tab]
     items: TreeMap[str, LineItem]
     statements: TreeMap[str, Statement]
+    disputes: TreeMap[str, Dispute]
 
     def __init__(self, bond_atto: u256, dispute_window_seconds: u256) -> None:
         if dispute_window_seconds == 0:
@@ -234,9 +254,12 @@ class Notch(gl.Contract):
     def _is_final(self, s: Statement) -> bool:
         if s.status in (STATUS_ACCEPTED, STATUS_SETTLED):
             return True
-        # ponytail: the "and no dispute is open" half of the rule lands in
-        # Task 4, which is where dispute state first exists. Until then an
-        # elapsed window is the only path to auto-accept.
+        if s.status == STATUS_DISPUTED:
+            # Spec §4 auto-accepts a cycle that is "neither accepted nor
+            # disputed". An open dispute has to outlast the window, or the biller
+            # waits it out and files a receipt on a statement under judgment.
+            # `resolve()` moves the status on, which lets finality resume.
+            return False
         now = datetime.datetime.fromisoformat(gl.message_raw["datetime"])
         closed = datetime.datetime.fromisoformat(s.closed_at)
         # timedelta comparison, not total_seconds(): the constraints forbid
@@ -280,3 +303,100 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} not final")
         s.status = STATUS_SETTLED
         s.settle_ref = settle_ref
+
+    @gl.public.write.payable
+    def open_dispute(self, statement_id: str, notch_ids: list[str],
+                     claim_kind: str, claim: str) -> None:
+        s = self._statement(statement_id)
+        who = gl.message.sender_address
+        if not self._member(self.tabs[s.tab_id], who):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} not a member")
+        # The status slot of the guard order carries both messages, because
+        # `disputed` is a status *and* the "no existing dispute" rule: this method
+        # writes `s.status` and `self.disputes[dispute_id]` together, so the two
+        # are equivalent, and a bare `not open` on a re-file would tell the filer
+        # nothing about the dispute already under judgment.
+        if s.status == STATUS_DISPUTED:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} already disputed")
+        if s.status != STATUS_OPEN:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} not open")
+        # Disputable and final are exact complements, so this asks `_is_final`
+        # instead of recomputing the window beside it: two copies of that rule
+        # could drift into a statement that is both, or neither.
+        if self._is_final(s):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} window closed")
+        # The bond is native GEN, and this is the only method that custodies
+        # value. An overpay is accepted rather than refunded — a refund means an
+        # outbound transfer inside intake, which §6 keeps out of every
+        # consensus-critical path — so what is recorded below is what was paid.
+        if int(gl.message.value) < int(self.bond_atto):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} bond too small")
+        # Spec §3: "one or more notch ids". Empty buys a verdict on nothing, and
+        # a repeated id inflates the disputed total that Task 5 sums and clamps
+        # `adjusted_atto` against, so a duplicate is rejected rather than folded.
+        if len(notch_ids) == 0:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no notches")
+        if len(set(notch_ids)) != len(notch_ids):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} duplicate notch id")
+        in_statement = [x for x in s.notch_ids]
+        for i in notch_ids:
+            if i not in in_statement:
+                raise gl.vm.UserError(f"{ERROR_EXPECTED} notch not in statement")
+        # A second pass, deliberately: folding this into the loop above would
+        # report whichever guard the *first bad id* trips, not the guard order.
+        for i in notch_ids:
+            if self.items[i].payer != who:
+                # Only the debtor may contest a bill.
+                raise gl.vm.UserError(f"{ERROR_EXPECTED} not the payer")
+        # Task 9 credits the forfeited bond to a single winner, and notches from
+        # two payees have no unambiguous one. Rejecting the filing here is a far
+        # smaller diff than pro-rata distribution downstream.
+        if len({self.items[i].payee for i in notch_ids}) > 1:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} mixed payees")
+        if claim_kind not in CLAIM_KINDS:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} unknown claim_kind")
+
+        # ponytail: one dispute per statement — the id is derived, not counted.
+        # Concurrent disputes over one statement would need per-leg locking and
+        # buy nothing at demo scale; a DynArray of disputes if a real user asks.
+        # Nothing can overwrite a bonded record while that holds: reaching this
+        # line requires `s.status == open`, and the assignment below leaves it
+        # `disputed` forever after. A later task that reopens a statement has to
+        # re-add the key check with it.
+        d = self.disputes.get_or_insert_default(f"{statement_id}#d")
+        d.statement_id = statement_id
+        d.claimant = who
+        d.claim_kind = claim_kind
+        d.claim = claim
+        d.bond_atto = u256(int(gl.message.value))
+        d.status = STATUS_OPEN
+        d.outcome = ""
+        d.adjusted_atto = u256(0)
+        d.evidence_hash_matched = False
+        d.rationale = ""
+        d.opened_at = gl.message_raw["datetime"]
+        for i in notch_ids:
+            d.notch_ids.append(i)
+        s.status = STATUS_DISPUTED
+
+    def _dispute(self, dispute_id: str) -> Dispute:
+        """The statement-side `_statement` guard, for dispute ids.
+
+        Same reason: `TreeMap.__getitem__` raises a bare `KeyError()` carrying an
+        empty message, and spec §5 has validators compare errors by prefix.
+        """
+        if dispute_id not in self.disputes:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no such dispute")
+        return self.disputes[dispute_id]
+
+    @gl.public.view
+    def get_dispute(self, dispute_id: str) -> dict:
+        d = self._dispute(dispute_id)
+        return {"statement_id": d.statement_id, "claimant": d.claimant.as_hex,
+                "claim_kind": d.claim_kind, "claim": d.claim,
+                "bond_atto": d.bond_atto, "status": d.status,
+                "outcome": d.outcome, "adjusted_atto": d.adjusted_atto,
+                "evidence_hash_matched": d.evidence_hash_matched,
+                "rationale": d.rationale, "opened_at": d.opened_at,
+                "notch_ids": [x for x in d.notch_ids],
+                "cited": [x for x in d.cited]}
