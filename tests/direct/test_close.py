@@ -100,3 +100,25 @@ def test_close_requires_notches(direct_vm, direct_deploy, direct_alice,
     c = _tab(direct_vm, direct_deploy, direct_alice, direct_bob)
     with direct_vm.expect_revert("[EXPECTED] nothing to close"):
         c.close("t1")
+
+
+def test_close_guards(direct_vm, direct_deploy, direct_alice, direct_bob,
+                      direct_charlie):
+    """Exact messages, not just the fact of a revert.
+
+    Spec §5 has validators compare errors by prefix, so a typo'd message is a
+    consensus bug rather than a cosmetic one, and nothing else would catch it.
+    """
+    c = _tab(direct_vm, direct_deploy, direct_alice, direct_bob)
+    c.add_notch("t1", "n1", hex_of(direct_bob), 4, "a", URI, H, "off_spec")
+
+    with direct_vm.expect_revert("[EXPECTED] no such tab"):
+        c.close("nope")
+
+    # t1 exists and has a closeable notch, so only membership is violated.
+    direct_vm.sender = direct_charlie
+    with direct_vm.expect_revert("[EXPECTED] not a member"):
+        c.close("t1")
+
+    with direct_vm.expect_revert("[EXPECTED] no such statement"):
+        c.get_statement("t1:0")
