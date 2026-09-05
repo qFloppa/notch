@@ -12,6 +12,12 @@ BOND = 10**18
 URI = "https://ev.test/a.json"
 H = "0" * 64
 FIVE_MILLI = 5_000_000_000_000_000  # 0.005 USDC at atto scale
+# The magnitudes real amounts live at. `str()` of a float goes exponent form at
+# 1e16, so anything above 0.01 USDC is where a naive amount parse breaks — and
+# `atto=1000` is thirteen orders of magnitude below it, where the clamp hides
+# every such bug.
+FIFTEEN_MILLI = 15_000_000_000_000_000  # 0.015 USDC; `str(float(...))` is '1.5e+16'
+QUARTER = 250_000_000_000_000_000  # 0.25 USDC; a bill big enough not to clamp it
 
 # The evidence a notch commits to, and the hash that matches it. `H` above is
 # the opposite: a well-formed hash that matches nothing, for the tasks that
