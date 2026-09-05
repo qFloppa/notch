@@ -41,10 +41,24 @@ class Tab:
     notch_ids: DynArray[str]
 
 
+@allow_storage
+@dataclass
+class Statement:
+    tab_id: str
+    cycle: u256
+    closed_at: str
+    statement_hash: str
+    status: str
+    settle_ref: str
+    legs: DynArray[str]
+    notch_ids: DynArray[str]
+
+
 class Notch(gl.Contract):
     bond_atto: u256
     tabs: TreeMap[str, Tab]
     items: TreeMap[str, LineItem]
+    statements: TreeMap[str, Statement]
 
     def __init__(self, bond_atto: u256) -> None:
         self.bond_atto = bond_atto
@@ -128,3 +142,67 @@ class Notch(gl.Contract):
                 "cycle_seconds": t.cycle_seconds, "opened_at": t.opened_at,
                 "members": [m.as_hex for m in t.members],
                 "notch_count": len(t.notch_ids)}
+
+    @gl.public.write
+    def close(self, tab_id: str) -> str:
+        if tab_id not in self.tabs:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no such tab")
+        t = self.tabs[tab_id]
+        if not self._member(t, gl.message.sender_address):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} not a member")
+
+        cycle = int(t.cycle)
+        ids = [i for i in t.notch_ids if int(self.items[i].cycle) == cycle]
+        if len(ids) == 0:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} nothing to close")
+
+        # One signed running total per unordered pair. u256 cannot hold a sign,
+        # so the sign lives in the ordering: positive means `lo` owes `hi`.
+        pairs: dict[str, int] = {}
+        for i in ids:
+            n = self.items[i]
+            lo, hi = sorted([n.payer.as_hex, n.payee.as_hex])
+            signed = int(n.atto) if n.payer.as_hex == lo else -int(n.atto)
+            pairs[lo + "|" + hi] = pairs.get(lo + "|" + hi, 0) + signed
+
+        legs = []
+        for key in sorted(pairs.keys()):
+            amount = pairs[key]
+            if amount == 0:
+                continue
+            lo, hi = key.split("|")
+            debtor, creditor = (lo, hi) if amount > 0 else (hi, lo)
+            legs.append({"debtor": debtor, "creditor": creditor,
+                         "atto": abs(amount)})
+
+        # Content only — no timestamps — so a counterparty can rebuild this
+        # preimage off-chain and recompute the hash.
+        payload = json.dumps(
+            {"tab": tab_id, "cycle": cycle, "notches": sorted(ids), "legs": legs},
+            sort_keys=True, separators=(",", ":"),
+        )
+        sid = f"{tab_id}:{cycle}"
+        s = self.statements.get_or_insert_default(sid)
+        s.tab_id = tab_id
+        s.cycle = u256(cycle)
+        s.closed_at = gl.message_raw["datetime"]
+        s.statement_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        s.status = "open"
+        s.settle_ref = ""
+        for i in sorted(ids):
+            s.notch_ids.append(i)
+        for leg in legs:
+            s.legs.append(json.dumps(leg, sort_keys=True, separators=(",", ":")))
+        t.cycle = u256(cycle + 1)
+        return sid
+
+    @gl.public.view
+    def get_statement(self, statement_id: str) -> dict:
+        if statement_id not in self.statements:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no such statement")
+        s = self.statements[statement_id]
+        return {"tab_id": s.tab_id, "cycle": s.cycle, "closed_at": s.closed_at,
+                "statement_hash": s.statement_hash, "status": s.status,
+                "settle_ref": s.settle_ref,
+                "legs": [json.loads(x) for x in s.legs],
+                "notch_ids": [x for x in s.notch_ids]}
