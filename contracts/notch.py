@@ -15,10 +15,13 @@ ERROR_LLM = "[LLM_ERROR]"
 CLAIM_KINDS = ("not_delivered", "off_spec", "overcharged", "duplicate", "sla_breach")
 OUTCOMES = ("upheld", "adjusted", "rejected")
 PRECEDENT_CAP = 5
-# What a prior ruling shows the judge: fields this contract computed, and nothing
-# a model wrote. An allow-list rather than "everything except `rationale`", so a
-# field added to the stored summary later cannot reach a prompt until someone puts
-# it here on purpose.
+# What a prior ruling shows the judge. The property is that it carries no free
+# text: a closed enum, a clamped integer, a bool, and two ids. `outcome` and
+# `adjusted_atto` are the model's word and the model's number — constrained by
+# this contract, not computed by it — so the claim is "nothing a model wrote
+# freely", not "nothing a model chose". An allow-list rather than "everything
+# except `rationale`", so a field added to the stored summary later cannot reach a
+# prompt until someone puts it here on purpose.
 JUDGE_FIELDS = ("adjusted_atto", "case_id", "claim_kind",
                 "evidence_hash_matched", "outcome")
 
@@ -120,6 +123,24 @@ class Notch(gl.Contract):
 
     @gl.public.write
     def open_tab(self, tab_id: str, members: list[str], cycle_seconds: u256) -> None:
+        # Checked before `tab exists`, because that guard uses this argument as a
+        # key. Every derived id flows from here — `close()` builds `f"{tab_id}:
+        # {cycle}"` and `open_dispute` appends `#d` — and the case id reaches the
+        # judge's prompt in PRIOR RULINGS, persistently and cross-tab. An
+        # unconstrained tab id is therefore a party-authored text channel into
+        # every later verdict of that claim kind. One guard at the root closes it
+        # for statement ids and dispute ids too.
+        #
+        # Alphanumerics, `-` and `_`: enough for a UUID, hex or a slug, and it
+        # excludes the `:` and `#` separators those derived ids are built with, so
+        # no id can be ambiguous about where the tab part ends. Capped like
+        # `rationale` is — five unbounded case ids in PRIOR RULINGS is an
+        # unbounded prompt. `""` is rejected on the sentinel-collision grounds
+        # `settle_ref` and `evidence_hash` already use.
+        if not 0 < len(tab_id) <= 64 or any(
+            not (c.isascii() and (c.isalnum() or c in "-_")) for c in tab_id
+        ):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} bad tab_id")
         if tab_id in self.tabs:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} tab exists")
         if len(members) < 2:
@@ -661,8 +682,9 @@ class Notch(gl.Contract):
         # matches the statement-hash convention in `close()`.
         #
         # PRIOR RULINGS is narrower than what is stored, and that is the defence:
-        # every field the judge sees is computed by this contract, and the one
-        # stored field a model wrote — `rationale` — is left out of
+        # no field the judge sees carries free text — a closed enum, a clamped
+        # integer, a bool, and two ids — so the one stored field a model wrote
+        # freely, `rationale`, is left out of
         # `JUDGE_FIELDS`. Escaping it, as the evidence is escaped, would have been
         # weaker here for two reasons. It is *persistent* and cross-tab: win one
         # dispute with evidence that induces an instruction-bearing rationale and
