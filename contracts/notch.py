@@ -722,6 +722,116 @@ class Notch(gl.Contract):
         out["evidence_hash_matched"] = True
         return out
 
+    def _agree(self, leaders_res: gl.vm.Result, leader_fn) -> bool:
+        """Does this validator accept the leader's verdict?
+
+        The equivalence rule. It is **comparative**: the validator re-runs the
+        whole leader function — re-fetching the evidence, re-hashing it,
+        re-asking the model — and compares outcomes. A schema-only check would
+        confirm the leader returned well-formed JSON and nothing else, which
+        would let one node decide a settlement alone.
+
+        Compared: `outcome` and `evidence_hash_matched` exactly, `adjusted_atto`
+        exactly unless the outcome is `adjusted`, where a ±1% band absorbs two
+        honest models pricing the same partial delivery differently. The band is
+        reachable for exactly **one** outcome because `_parse_verdict` pins the
+        amount to 0 for `upheld` and to the disputed total for `rejected` — so
+        the tolerance can never move money on the outcomes that do not need it.
+
+        Not compared: `rationale` and `cited_case_ids`. Spec §5 stores them as
+        metadata and excludes them from the comparison; two honest validators
+        phrase prose differently, and comparing it would fail consensus for no
+        gain.
+
+        Disagreement is cheap — it costs a consensus round — so every uncertain
+        case resolves to False. What it cannot do is agree wrongly.
+        """
+        if not isinstance(leaders_res, gl.vm.Return):
+            # Two distinct types land here. `gl.vm.Result` is a three-way union:
+            # `UserError` (the contract raised) and `VMError` (the VM failed —
+            # OOM, exit code) both carry `.message`, and only `Return` carries
+            # `.calldata`. A `VMError` message begins with a VM code, so it
+            # matches none of the four prefixes and correctly forces rotation.
+            return self._agree_on_error(leaders_res, leader_fn)
+
+        theirs = leaders_res.calldata
+        try:
+            mine = leader_fn()
+        except gl.vm.UserError:
+            # The mirror of `_agree_on_error`'s first case: the leader produced a
+            # verdict and this validator cannot. A flaky fetch on our side, or
+            # evidence the leader could reach and we cannot. We have no grounds
+            # to endorse a settlement we could not derive, so refuse and let the
+            # next round decide.
+            return False
+        # A leader whose result is missing a field is not a leader to agree
+        # with. Read through `.get` rather than subscripting: a bare `KeyError`
+        # carries an empty message, and while an exception escaping a validator
+        # is already treated as `Disagree` by the executor, that turns a clean
+        # disagreement into a validator error and loses the reason.
+        if not isinstance(theirs, dict):
+            return False
+        for field in ("outcome", "adjusted_atto", "evidence_hash_matched"):
+            if field not in theirs:
+                return False
+
+        if bool(theirs["evidence_hash_matched"]) != bool(mine["evidence_hash_matched"]):
+            return False
+        if str(theirs["outcome"]) != str(mine["outcome"]):
+            return False
+        try:
+            a, b = int(theirs["adjusted_atto"]), int(mine["adjusted_atto"])
+        except (ValueError, TypeError):
+            return False
+        if mine["outcome"] != "adjusted":
+            return a == b                      # pinned to 0 or total, must match
+        # No zero short-circuit: `adjusted_atto` is clamped non-negative by
+        # `_parse_verdict`, so `max(a, b) == 0` implies both are 0, and the
+        # comparison below already answers `0 <= 0`. A guard for it would be a
+        # branch no input can distinguish — and mutation-testing it proved
+        # exactly that, which is why it is a comment instead of code.
+        #
+        # Integer arithmetic, deliberately: the constraints forbid floats, and a
+        # consensus threshold computed in binary floating point is a threshold
+        # that can land differently on two honest nodes.
+        return abs(a - b) * 100 <= max(a, b)   # within 1%
+
+    def _agree_on_error(self, leaders_res, leader_fn) -> bool:
+        """The leader failed. Do we fail the same way?
+
+        Spec §5: deterministic errors must match exactly, transient errors
+        agree, LLM errors always disagree to force rotation. The prefixes are
+        the whole mechanism, which is why every guard in this contract carries
+        one and why their exact text is asserted by tests.
+        """
+        leader_msg = getattr(leaders_res, "message", "")
+        try:
+            leader_fn()
+            # The leader failed where we succeeded. Nothing to agree about.
+            return False
+        except gl.vm.UserError as e:
+            mine = getattr(e, "message", str(e))
+            if mine.startswith(ERROR_EXPECTED) or mine.startswith(ERROR_EXTERNAL):
+                # Deterministic: same inputs, same error, character for
+                # character. A typo in a guard message is a consensus bug, not a
+                # cosmetic one.
+                return mine == leader_msg
+            if mine.startswith(ERROR_TRANSIENT) and leader_msg.startswith(ERROR_TRANSIENT):
+                # Both hit a flaky fetch. Neither has grounds to rule, and both
+                # know it — agreeing here reverts the transaction cleanly instead
+                # of burning rotations on a network blip.
+                return True
+            # `[LLM_ERROR]` and anything unrecognised: rotate. A model that
+            # returned garbage to one node may return sense to the next, which is
+            # exactly what rotation is for.
+            return False
+        except Exception:
+            # Redundant but cheap: `run_nondet_unsafe` already maps a validator
+            # exception to `Disagree`, so this changes nothing about the outcome.
+            # It is here so the reason is visible in the code rather than
+            # inferred from the SDK's docs.
+            return False
+
     @gl.public.write
     def resolve(self, dispute_id: str) -> dict:
         # No authorization guard, deliberately: the verdict reads committed
@@ -736,11 +846,7 @@ class Notch(gl.Contract):
             return self._leader(dispute_id)
 
         def validator_fn(leaders_res: gl.vm.Result) -> bool:
-            # Safe by default. A validator that always agrees is the exact
-            # anti-pattern the SDK warns about; disagreeing only costs a
-            # consensus retry. Task 7 makes this real before any integration
-            # test runs against a network.
-            return False
+            return self._agree(leaders_res, leader_fn)
 
         v = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
