@@ -7,6 +7,7 @@ up is a Windows-only bug in that plugin's loader — see the bottom of this file
 
 import datetime
 import hashlib
+import json
 
 BOND = 10**18
 URI = "https://ev.test/a.json"
@@ -59,6 +60,19 @@ def past_window(direct_vm, c, sid) -> None:
     assert c.get_dispute_window_seconds() == 3600
     closed = datetime.datetime.fromisoformat(c.get_statement(sid)["closed_at"])
     direct_vm.warp((closed + datetime.timedelta(seconds=3601)).isoformat())
+
+
+def _verdict(**over) -> str:
+    """The model's reply as JSON. Defaults to a well-formed `rejected`.
+
+    One copy for every test that mocks a verdict: two files register these, and a
+    default that drifted in one of them would leave the other asserting a shape
+    the contract no longer sees.
+    """
+    v = {"outcome": "rejected", "adjusted_atto": 1000,
+         "rationale": "the receipt matches the bill", "cited_case_ids": []}
+    v.update(over)
+    return json.dumps(v)
 
 
 def _serves(direct_vm, status=200, body=BODY):

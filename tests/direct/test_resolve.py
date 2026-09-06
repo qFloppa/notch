@@ -13,16 +13,12 @@ import json
 import re
 
 from conftest import (BOND, FIFTEEN_MILLI, QUARTER, URI_PATTERN, _disputed,
-                      _serves, past_window)
+                      _serves, _verdict, past_window)
 
 
 def _model_says(direct_vm, **over):
     """Register the model's reply. Defaults to a well-formed `rejected`."""
-    verdict = {"outcome": "rejected", "adjusted_atto": 1000,
-               "rationale": "the receipt matches the bill",
-               "cited_case_ids": []}
-    verdict.update(over)
-    direct_vm.mock_llm(r".*", json.dumps(verdict))
+    direct_vm.mock_llm(r".*", _verdict(**over))
 
 
 def test_hash_mismatch_upholds_without_asking_the_model(
