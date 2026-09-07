@@ -1,0 +1,27 @@
+# gltest configuration. Also silences the WARNING/INFO banner the direct suite
+# printed on every run (the Task 1 deferred minor).
+#
+# Keys are the three `gltest_cli/config/user.py` accepts — `networks`, `paths`,
+# `environment` — and nothing else; anything extra is a hard configuration error.
+# Two traps in here, both found by hitting them:
+#   - `paths.contracts`, not the `contract_path` some docs show.
+#   - the default network is `networks.default` (popped in `_get_overridden_networks`),
+#     NOT a top-level `default_network` key.
+#
+# Default is studionet, not localnet: GLSim 0.29.2 cannot deploy any contract on
+# Windows (see tools/glsim_win.py for the one bug that is fixable and the ledger
+# for the one that is not — a 13-line contract reproduces it, so it is upstream,
+# not ours). studionet is hosted, gasless, and needs no funded account.
+paths:
+  contracts: contracts
+
+environment: .env
+
+networks:
+  default: studionet
+  studionet: {}
+  localnet:
+    # Local GLSim, currently blocked. Launch via the Windows wrapper, never the
+    # bare `glsim` script: .venv/Scripts/python.exe tools/glsim_win.py \
+    #   --port 4000 --validators 5 --seed 42
+    url: http://127.0.0.1:4000/api
