@@ -90,8 +90,47 @@ class Dispute:
     evidence_hash_matched: bool
     rationale: str
     opened_at: str
+    # Whether the bond has been credited to its winner. Its own flag rather than
+    # a read of `status`, because it guards a money write — see `_settle_bond`.
+    bond_settled: bool
     notch_ids: DynArray[str]
     cited: DynArray[str]
+
+
+@gl.evm.contract_interface
+class _Payee:
+    """The winner of a bond, as an address this contract can send value to.
+
+    Declared as an EVM interface purely to reach its `emit_transfer`, which is
+    `EthSend` with **empty calldata** — no method is ever called on it, hence the
+    empty `View` and `Write`. This is not `gl.get_contract_at(...)`, and the
+    difference is load-bearing rather than stylistic.
+
+    `gl.get_contract_at(eoa).emit_transfer(...)` was the plan's line and it is
+    **disproven**: on studionet the emitted child transaction fails with
+    `Contract 0x... not found` — a `PostMessage` recipient must be a deployed
+    contract — and the value is **not refunded**, so the bond is destroyed. A
+    winner here is an agent's own account, so that path burns the money it is
+    supposed to pay out.
+
+    `EthSend` succeeds against the same address, and it resolves *synchronously*.
+    That is the property `withdraw()` relies on: a failure raises inside the
+    call and reverts the credit zeroing with it, so the ledger and the coin can
+    never disagree. It either pays or it reverts.
+
+    What is **not** proven: that the recipient's balance actually rises. Neither
+    instrument studionet offers can show it — `eth_getBalance` reads 0 for every
+    address including the one paying for deploys, and `wasi.get_balance` on
+    another address crashes the call. The evidence is asymmetric rather than
+    complete: the `PostMessage` path failed loudly and this one did not fail at
+    all. Recorded here so nobody reads this as verified delivery.
+    """
+
+    class View:
+        pass
+
+    class Write:
+        pass
 
 
 class Notch(gl.Contract):
@@ -108,6 +147,11 @@ class Notch(gl.Contract):
     # rather than a search.
     precedents: TreeMap[str, str]
     precedent_by_kind: TreeMap[str, DynArray[str]]
+    # Who is owed a forfeited bond. Spec §6 pays the winner by **pull**, so this
+    # is the whole settlement: `resolve` credits, `withdraw` collects. Nothing
+    # outbound happens inside `resolve`, which keeps the one nondeterministic
+    # method free of value transfers.
+    bond_credit: TreeMap[Address, u256]
 
     def __init__(self, bond_atto: u256, dispute_window_seconds: u256) -> None:
         if dispute_window_seconds == 0:
@@ -115,6 +159,12 @@ class Notch(gl.Contract):
             # so nobody could ever dispute one. `open_tab` guards the analogous
             # `cycle_seconds == 0`.
             raise gl.vm.UserError(f"{ERROR_EXPECTED} zero window")
+        if bond_atto == 0:
+            # Spec §6: filing has to cost something, "which is what stops the
+            # free-claim griefing a judge will otherwise ask about". At zero the
+            # bond is decorative — every forfeit credits nothing, so losing a
+            # dispute is free and `withdraw` has nothing to pay out.
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} zero bond")
         self.bond_atto = bond_atto
         self.dispute_window_seconds = dispute_window_seconds
 
@@ -424,6 +474,7 @@ class Notch(gl.Contract):
         d.evidence_hash_matched = False
         d.rationale = ""
         d.opened_at = gl.message_raw["datetime"]
+        d.bond_settled = False
         for i in notch_ids:
             d.notch_ids.append(i)
         s.status = STATUS_DISPUTED
@@ -447,6 +498,7 @@ class Notch(gl.Contract):
                 "outcome": d.outcome, "adjusted_atto": d.adjusted_atto,
                 "evidence_hash_matched": d.evidence_hash_matched,
                 "rationale": d.rationale, "opened_at": d.opened_at,
+                "bond_settled": d.bond_settled,
                 "notch_ids": [x for x in d.notch_ids],
                 "cited": [x for x in d.cited]}
 
@@ -523,6 +575,51 @@ class Notch(gl.Contract):
         # appending to an existing record is the point, because append order is
         # resolution order.
         self.precedent_by_kind.get_or_insert_default(d.claim_kind).append(dispute_id)
+
+    def _settle_bond(self, dispute_id: str) -> None:
+        """Credit the forfeited bond to whoever won. `resolve`'s last write.
+
+        Spec §6: the loser forfeits to the winner, and the value lands on an
+        internal ledger rather than being sent — "a pull, not a push, so no
+        outbound transfer happens inside a consensus-critical path, and a failed
+        send can never wedge a verdict". `withdraw` is the other half.
+
+        Win/lose is binary: the claimant wins unless the claim was `rejected`
+        outright, so a partial win is still a win.
+        ponytail: pro-rating the bond to the adjustment ratio is a one-line
+        change here if anyone ever cares. Nobody does at demo scale, and a
+        split bond needs a second credit and a rounding rule to argue about.
+        """
+        d = self.disputes[dispute_id]
+        # Guarded on its own flag, not on `resolve`'s `already resolved` status
+        # proxy, for the reason `_record_precedent` and `open_dispute` are: this
+        # is where money is written, and a second credit would mint a bond that
+        # was never posted. Returning rather than raising, because raising here
+        # would revert the verdict written above it — including the write that
+        # unfreezes finality.
+        #
+        # The guard survives mutation, and that is structural rather than an
+        # untested branch: `resolve` raises `already resolved` before it can
+        # reach here twice, so no reachable input distinguishes the guarded form
+        # from the unguarded one. Measured — deleting it leaves the suite green.
+        # It stays for the same reason `_record_precedent`'s does: the status
+        # check is a proxy one method away, and this is the line that moves
+        # value. `bond_settled` is also read by `get_dispute`, so it is not only
+        # a guard.
+        if d.bond_settled:
+            return
+        d.bond_settled = True
+        if d.outcome == "rejected":
+            # The claim was wrong, so the biller keeps the bill and takes the
+            # bond. `notch_ids[0]` is unambiguous because `open_dispute` rejects
+            # a bundle spanning two payees — that guard exists for this line.
+            winner = self.items[d.notch_ids[0]].payee
+        else:
+            # `upheld` or `adjusted`: the claimant was right, at least in part,
+            # and gets its own bond back.
+            winner = d.claimant
+        self.bond_credit[winner] = u256(
+            int(self.bond_credit.get(winner, u256(0))) + int(d.bond_atto))
 
     @gl.public.view
     def preview_precedents(self, kind: str) -> list:
@@ -922,4 +1019,39 @@ class Notch(gl.Contract):
         # the fields written above, so a call any earlier would record an empty
         # one. Outside the nondet block by necessity — it writes storage.
         self._record_precedent(dispute_id)
+        # Same requirement, same reason: it reads `d.outcome`, written above.
+        self._settle_bond(dispute_id)
         return v
+
+    @gl.public.view
+    def get_bond_credit(self, who: str) -> int:
+        """What `who` may withdraw. Zero for an address with no forfeits owed.
+
+        Answers rather than raises for an unknown address: "no bond owed" is the
+        honest reading of a key that was never written, and the alternative
+        would have every caller guard a lookup that has a correct empty answer.
+        """
+        return int(self.bond_credit.get(Address(who), u256(0)))
+
+    @gl.public.write
+    def withdraw(self) -> None:
+        """Collect forfeited bonds. Spec §6's pull half.
+
+        No argument and no recipient parameter: the sender is the payee, so
+        there is no way to ask this contract to pay a third party.
+        """
+        who = gl.message.sender_address
+        amount = int(self.bond_credit.get(who, u256(0)))
+        if amount == 0:
+            # Also load-bearing beyond the message: `emit_transfer` raises a
+            # bare `ValueError` on a non-positive value, and a ValueError here is
+            # a VM error rather than a prefixed one.
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} nothing to withdraw")
+        # Zeroed before the send, and safe to do so *because* the send is
+        # synchronous: if it fails it raises, and this write reverts with it.
+        # The reverse order would leave the credit claimable twice for as long
+        # as the transfer took. See `_Payee` for why the emitted-message API
+        # cannot be used here — with that one, a failure keeps the zero and
+        # destroys the coin.
+        self.bond_credit[who] = u256(0)
+        _Payee(who).emit_transfer(value=u256(amount))

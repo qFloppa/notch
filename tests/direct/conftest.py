@@ -80,12 +80,17 @@ def _serves(direct_vm, status=200, body=BODY):
     direct_vm.mock_web(URI_PATTERN, {"status": status, "body": body})
 
 
-def _disputed(direct_vm, direct_deploy, a, b, evidence_hash=GOOD_H, atto=1000):
+def _disputed(direct_vm, direct_deploy, a, b, evidence_hash=GOOD_H, atto=1000,
+              paid=BOND):
     """One notch, closed, and under dispute. `(contract, statement_id, dispute_id)`.
 
     `a` bills and closes; `b` is the payer, so `b` is the only party who may
     contest it. The evidence hash defaults to the one that matches `BODY`, so a
     test that wants the mismatch short-circuit passes its own.
+
+    `paid` is what the claimant actually attaches, which is not the same as the
+    required bond: `open_dispute` accepts an overpay rather than refunding it and
+    records what was paid, so the bond tests need to vary it.
 
     Returns the statement id as well as the dispute id: the statement's status
     is what a resolution unfreezes, and reconstructing `sid` from `dispute_id`
@@ -98,7 +103,7 @@ def _disputed(direct_vm, direct_deploy, a, b, evidence_hash=GOOD_H, atto=1000):
                 URI, evidence_hash, "off_spec")
     sid = c.close("t1")
     direct_vm.sender = b
-    direct_vm.value = BOND
+    direct_vm.value = paid
     c.open_dispute(sid, ["n1"], "off_spec", "the total is wrong")
     # Back to zero. `open_dispute` is the only payable method, and GenVM rejects
     # value sent to a non-payable one (`_genlayer_runner.py`) while direct mode
