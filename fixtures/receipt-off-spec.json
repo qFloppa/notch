@@ -1,0 +1,1 @@
+{"invoice": "INV-1043", "period": "2026-08", "text": "receipt: TOTAL 0.00 USDC - request failed, no content returned", "lines": [{"sku": "api-calls", "qty": 0, "atto": 0, "status": "error: upstream timeout after 30s"}]}
