@@ -10,6 +10,11 @@ import hashlib
 import json
 
 BOND = 10**18
+# The unsecured tab an agent with no history gets, 10 USDC at atto scale. Also
+# the price of one lost dispute, since the penalty is `lost_count * base` — so
+# the credit table's rows are all multiples of this one number, and a test that
+# hardcoded 10**19 instead would stop meaning anything if the deploy changed.
+BASE = 10 * 10**18
 URI = "https://ev.test/a.json"
 URI_PATTERN = r".*ev\.test.*"   # what a mocked evidence host answers to
 H = "0" * 64
@@ -96,7 +101,7 @@ def _disputed(direct_vm, direct_deploy, a, b, evidence_hash=GOOD_H, atto=1000,
     is what a resolution unfreezes, and reconstructing `sid` from `dispute_id`
     by string surgery in every caller is worse than one more tuple slot.
     """
-    c = direct_deploy("contracts/notch.py", BOND, 3600)
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
     direct_vm.sender = a
     c.open_tab("t1", [hex_of(a), hex_of(b)], 86400)
     c.add_notch("t1", "n1", hex_of(b), atto, "return the receipt total",

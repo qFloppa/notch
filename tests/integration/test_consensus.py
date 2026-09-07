@@ -66,11 +66,15 @@ ATTO = 1000
 # to resolve would arrive as a synthetic 5xx and hang on retries instead — which is
 # why scenario 4 pins the URLs' real status codes.
 WINDOW = 3600
+# The unsecured tab a fresh agent gets. No test here reads it back -- it is
+# here because the constructor requires it; the credit table lives in
+# tests/direct/test_credit.py, where it needs no network.
+BASE_CREDIT = 10 * 10**18
 
 
 def _deploy():
     return get_contract_factory(contract_file_path="notch.py").deploy(
-        args=[BOND, WINDOW])
+        args=[BOND, WINDOW, BASE_CREDIT])
 
 
 def _disputed(c, evidence_uri, evidence_hash, claim_kind="off_spec"):

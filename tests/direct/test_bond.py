@@ -27,7 +27,7 @@ mode is silent about that. See `_Payee` in the contract.
 """
 
 import pytest
-from conftest import BOND, _disputed, _serves, _verdict, hex_of
+from conftest import BASE, BOND, _disputed, _serves, _verdict, hex_of
 
 
 def _resolved(direct_vm, direct_deploy, a, b, outcome, atto=1000, paid=BOND,
@@ -172,4 +172,4 @@ def test_a_zero_bond_cannot_be_deployed(direct_vm, direct_deploy):
     existing `zero window` check, which is the same class of deploy-time footgun.
     """
     with direct_vm.expect_revert("[EXPECTED] zero bond"):
-        direct_deploy("contracts/notch.py", 0, 3600)
+        direct_deploy("contracts/notch.py", 0, 3600, BASE)

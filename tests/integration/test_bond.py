@@ -28,7 +28,6 @@ deploys, and `wasi.get_balance` on another address crashes the call into an HTML
 error page. Asserting on a dead instrument is worse than asserting nothing, so
 this file asserts what it can actually observe and says so out loud.
 """
-import pytest
 from genlayer_py.types import TransactionStatus
 from gltest import get_contract_factory
 from gltest.accounts import get_accounts
@@ -46,6 +45,10 @@ WRONG_HASH = "0" * 64
 BOND = 10 ** 15
 ATTO = 1000
 WINDOW = 3600
+# The unsecured tab a fresh agent gets. No test here reads it back -- it is
+# here because the constructor requires it; the credit table lives in
+# tests/direct/test_credit.py, where it needs no network.
+BASE_CREDIT = 10 * 10**18
 
 
 def _resolved_in_the_claimant_s_favour():
@@ -62,7 +65,7 @@ def _resolved_in_the_claimant_s_favour():
     biller, payer = accts[0], accts[1]
 
     c = get_contract_factory(contract_file_path="notch.py").deploy(
-        args=[BOND, WINDOW])
+        args=[BOND, WINDOW, BASE_CREDIT])
     assert tx_execution_succeeded(
         c.open_tab(args=["t1", [biller.address, payer.address], 86400]).transact())
     assert tx_execution_succeeded(

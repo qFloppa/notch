@@ -5,12 +5,12 @@ final once the dispute window has elapsed. That is what makes the netting
 binding rather than advisory.
 """
 
-from conftest import BOND, URI, H, hex_of, past_window
+from conftest import BASE, BOND, URI, H, hex_of, past_window
 
 
 def _closed(direct_vm, direct_deploy, a, b):
     """A tab with one notch, closed. Returns `(contract, statement_id)`."""
-    c = direct_deploy("contracts/notch.py", BOND, 3600)
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
     direct_vm.sender = a
     c.open_tab("t1", [hex_of(a), hex_of(b)], 86400)
     c.add_notch("t1", "n1", hex_of(b), 9, "a", URI, H, "off_spec")
@@ -103,7 +103,7 @@ def test_settle_guards(direct_vm, direct_deploy, direct_alice, direct_bob,
 def test_zero_dispute_window_is_rejected(direct_vm, direct_deploy):
     """A zero window would make every statement final the instant it closed."""
     with direct_vm.expect_revert("[EXPECTED] zero window"):
-        direct_deploy("contracts/notch.py", BOND, 0)
+        direct_deploy("contracts/notch.py", BOND, 0, BASE)
 
 
 def test_closer_cannot_accept_its_own_statement(direct_vm, direct_deploy,

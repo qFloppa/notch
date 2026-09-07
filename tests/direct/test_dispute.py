@@ -7,7 +7,7 @@ contract (spec §6) — so the amount recorded on the dispute is what was actual
 paid, not the minimum that was demanded.
 """
 
-from conftest import BOND, URI, H, hex_of, past_window
+from conftest import BASE, BOND, URI, H, hex_of, past_window
 
 
 def _closed_statement(direct_vm, direct_deploy, a, b):
@@ -16,7 +16,7 @@ def _closed_statement(direct_vm, direct_deploy, a, b):
     `a` also closes, so `a` is the statement's `closed_by`. That matters to
     `accept` and not at all to dispute intake, which gates on status alone.
     """
-    c = direct_deploy("contracts/notch.py", BOND, 3600)
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
     direct_vm.sender = a
     c.open_tab("t1", [hex_of(a), hex_of(b)], 86400)
     c.add_notch("t1", "n1", hex_of(b), 1000, "return the receipt total",
@@ -175,7 +175,7 @@ def test_mixed_payees_are_rejected(direct_vm, direct_deploy, direct_alice,
     This narrows spec §3's "one or more notch ids" to "from one payee", which
     the spec owner accepted.
     """
-    c = direct_deploy("contracts/notch.py", BOND, 3600)
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
     direct_vm.sender = direct_alice
     c.open_tab("t1", [hex_of(direct_alice), hex_of(direct_bob),
                       hex_of(direct_charlie)], 86400)
@@ -204,7 +204,7 @@ def test_several_notches_from_one_payee_are_one_dispute(
     The `mixed payees` guard must not catch this — two notches billed by the
     same payee have exactly one winner, which is all that guard protects.
     """
-    c = direct_deploy("contracts/notch.py", BOND, 3600)
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
     direct_vm.sender = direct_alice
     c.open_tab("t1", [hex_of(direct_alice), hex_of(direct_bob)], 86400)
     c.add_notch("t1", "n1", hex_of(direct_bob), 1000, "first", URI, H, "off_spec")

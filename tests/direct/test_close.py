@@ -5,14 +5,14 @@ commits a hash over `(tab_id, cycle, notch ids, legs)` — no timestamps — so 
 counterparty can recompute the statement off-chain from the preimage alone.
 """
 
-from conftest import BOND, URI, H, hex_of
+from conftest import BASE, BOND, URI, H, hex_of
 
 import hashlib
 import json
 
 
 def _tab(direct_vm, direct_deploy, a, b):
-    c = direct_deploy("contracts/notch.py", BOND, 3600)
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
     direct_vm.sender = a
     c.open_tab("t1", [hex_of(a), hex_of(b)], 86400)
     return c

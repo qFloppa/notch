@@ -136,6 +136,7 @@ class _Payee:
 class Notch(gl.Contract):
     bond_atto: u256
     dispute_window_seconds: u256
+    base_credit_atto: u256
     tabs: TreeMap[str, Tab]
     items: TreeMap[str, LineItem]
     statements: TreeMap[str, Statement]
@@ -152,8 +153,18 @@ class Notch(gl.Contract):
     # outbound happens inside `resolve`, which keeps the one nondeterministic
     # method free of value transfers.
     bond_credit: TreeMap[Address, u256]
+    # Settlement history, per agent. Spec §3 makes the credit limit "a pure
+    # function of settlement history: statements settled within their window,
+    # disputes lost, total volume cleared" — these are those three facts, and
+    # `credit_limit` is arithmetic over them. Deliberately not consensus work:
+    # reputation here is derived from on-chain records, never from an opinion, so
+    # no validator has to agree about anything to compute it.
+    settled_count: TreeMap[Address, u256]
+    lost_count: TreeMap[Address, u256]
+    cleared_atto: TreeMap[Address, u256]
 
-    def __init__(self, bond_atto: u256, dispute_window_seconds: u256) -> None:
+    def __init__(self, bond_atto: u256, dispute_window_seconds: u256,
+                 base_credit_atto: u256) -> None:
         if dispute_window_seconds == 0:
             # A zero window makes every statement final the instant it closes,
             # so nobody could ever dispute one. `open_tab` guards the analogous
@@ -167,6 +178,13 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} zero bond")
         self.bond_atto = bond_atto
         self.dispute_window_seconds = dispute_window_seconds
+        # Not guarded against zero, unlike the two above, because zero is a
+        # coherent policy: nobody gets an unsecured tab, everyone prepays. Worth
+        # knowing what else it does, though — the loss penalty is `lost_count *
+        # base`, so at base zero losing a dispute costs nothing and the limit is
+        # `cleared_atto // 10` alone, growing forever. A deployment that wants
+        # "no credit" wants zero here; one that wants "no forgiveness" does not.
+        self.base_credit_atto = base_credit_atto
 
     @gl.public.view
     def get_bond_atto(self) -> int:
@@ -397,6 +415,32 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} not final")
         s.status = STATUS_SETTLED
         s.settle_ref = settle_ref
+        self._record_settlement(s)
+
+    def _record_settlement(self, s: Statement) -> None:
+        """Book a settled statement against each debtor's history.
+
+        Needs no guard of its own, unlike `_settle_bond`: `already settled` above
+        is a reachable, tested refusal on this statement's own status, and status
+        is exactly what this reads. A second filing cannot get here.
+
+        Aggregated per debtor before writing, in two passes rather than one. A
+        debtor can appear in more than one leg — one per counterparty — so
+        incrementing inside the leg loop would count a single statement several
+        times, and `settled_count` means *statements*. `cleared_atto` sums either
+        way; it is written here too so both counters come from one walk of the
+        legs. Sorted for a deterministic write order.
+        """
+        owed: dict[str, int] = {}
+        for x in s.legs:
+            leg = json.loads(x)
+            owed[leg["debtor"]] = owed.get(leg["debtor"], 0) + int(leg["atto"])
+        for hex_addr in sorted(owed):
+            a = Address(hex_addr)
+            self.cleared_atto[a] = u256(
+                int(self.cleared_atto.get(a, u256(0))) + owed[hex_addr])
+            self.settled_count[a] = u256(
+                int(self.settled_count.get(a, u256(0))) + 1)
 
     @gl.public.write.payable
     def open_dispute(self, statement_id: str, notch_ids: list[str],
@@ -577,7 +621,8 @@ class Notch(gl.Contract):
         self.precedent_by_kind.get_or_insert_default(d.claim_kind).append(dispute_id)
 
     def _settle_bond(self, dispute_id: str) -> None:
-        """Credit the forfeited bond to whoever won. `resolve`'s last write.
+        """Credit the forfeited bond to whoever won, and book the loss. `resolve`'s
+        last write.
 
         Spec §6: the loser forfeits to the winner, and the value lands on an
         internal ledger rather than being sent — "a pull, not a push, so no
@@ -613,13 +658,20 @@ class Notch(gl.Contract):
             # The claim was wrong, so the biller keeps the bill and takes the
             # bond. `notch_ids[0]` is unambiguous because `open_dispute` rejects
             # a bundle spanning two payees — that guard exists for this line.
-            winner = self.items[d.notch_ids[0]].payee
+            winner, loser = self.items[d.notch_ids[0]].payee, d.claimant
         else:
             # `upheld` or `adjusted`: the claimant was right, at least in part,
             # and gets its own bond back.
-            winner = d.claimant
+            winner, loser = d.claimant, self.items[d.notch_ids[0]].payee
         self.bond_credit[winner] = u256(
             int(self.bond_credit.get(winner, u256(0))) + int(d.bond_atto))
+        # The same ruling that moves the bond is the one §3 counts as a dispute
+        # lost, so it is booked here rather than in a second walk of the verdict.
+        # Symmetric on purpose: a biller who billed for work it could not
+        # substantiate lost the dispute exactly as a claimant who filed a bad
+        # claim did, and §1's "lose a dispute, prepay" does not exempt either.
+        self.lost_count[loser] = u256(
+            int(self.lost_count.get(loser, u256(0))) + 1)
 
     @gl.public.view
     def preview_precedents(self, kind: str) -> list:
@@ -1055,3 +1107,49 @@ class Notch(gl.Contract):
         # destroys the coin.
         self.bond_credit[who] = u256(0)
         _Payee(who).emit_transfer(value=u256(amount))
+
+    @gl.public.view
+    def credit_limit(self, who: str) -> int:
+        """How large a tab `who` may run, from settlement history alone.
+
+        Spec §1's second compounding effect: "Pay clean, run a bigger tab. Lose a
+        dispute, prepay." Pure, deterministic arithmetic over on-chain records —
+        no model, no consensus round, nothing to disagree about. That is the
+        point rather than a shortcut: a reputation number a validator had to
+        judge would be a reputation number two validators could differ on.
+
+        `base + cleared // 10 - lost * base`, floored at zero. So a clean agent
+        starts at `base` and earns a tenth of everything it has ever settled,
+        while one lost dispute erases a whole `base` of standing. `max(0, ...)`
+        rather than a u256 subtraction, which would underflow rather than floor.
+
+        Integer division, and `//` not `/`: the constraints forbid floats
+        outright, and a credit limit computed in binary floating point is one
+        that can land differently on two honest nodes.
+
+        ponytail: read-only. Nothing in `add_notch` enforces this yet, so it is
+        the number an agent and the viewer consult, not a cap the contract
+        imposes. Enforcing it needs per-payer outstanding-balance tracking that
+        no method keeps today, plus a rule for notches already accrued when a
+        dispute is lost — real work, and out of this task's scope.
+        """
+        a = Address(who)
+        base = int(self.base_credit_atto)
+        earned = int(self.cleared_atto.get(a, u256(0))) // 10
+        penalty = int(self.lost_count.get(a, u256(0))) * base
+        return max(0, base + earned - penalty)
+
+    @gl.public.view
+    def get_credit_history(self, who: str) -> dict:
+        """The three facts `credit_limit` is computed from.
+
+        Exposed so the limit can be explained rather than only quoted — a payer
+        told "your limit is zero" can see which of the three moved. It is also
+        what makes `settled_count` real data instead of a write-only field: the
+        formula does not read it, §3 names it, and this is where it surfaces.
+        """
+        a = Address(who)
+        return {"settled_count": int(self.settled_count.get(a, u256(0))),
+                "lost_count": int(self.lost_count.get(a, u256(0))),
+                "cleared_atto": int(self.cleared_atto.get(a, u256(0))),
+                "credit_limit": self.credit_limit(who)}
