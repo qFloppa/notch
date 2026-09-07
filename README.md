@@ -86,11 +86,16 @@ arrived at an EOA.
 
 | Step | Measured |
 |---|---|
-| one `add_notch` | ~13s to ACCEPTED (40 consecutive writes, 9–18s each) |
+| one `add_notch` | 13–15s to ACCEPTED (40 consecutive writes, 9–18s each) |
 | `close` at 40 notches | 17s |
 | `resolve`, hash short-circuit | seconds — no model is consulted |
-| `resolve`, model path | 26–250s |
-| `withdraw` to FINALIZED | ~40–70s |
+| `resolve`, model path | 26s and 141s across the two demo runs |
+| `withdraw` to FINALIZED | 40s |
+
+Every figure above is from a run, not an estimate. `resolve` on the model path
+is the one with real spread: the same code path took 141s and then 26s, so treat
+it as "tens of seconds to a couple of minutes" rather than a number to plan
+against. (Task 8's real-model integration test saw ~250s on a heavier prompt.)
 
 `agents/seller.py --calls 200` is the plan's full scale and works, but it is
 ~43 minutes of billing. The default is 25. The claim does not rest on the count:
