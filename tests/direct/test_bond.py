@@ -45,6 +45,12 @@ def _resolved(direct_vm, direct_deploy, a, b, outcome, atto=1000, paid=BOND,
                                        adjusted_atto=adjusted_atto))
     v = c.resolve(did)
     assert v["outcome"] == outcome, "the mocked verdict did not reach the ledger"
+    # Not redundant with the line above, and the `upheld` row is why: `upheld`
+    # with `adjusted_atto == 0` is *also* exactly what the evidence-mismatch
+    # short-circuit returns, so if the served body and the committed hash ever
+    # drifted apart this helper would keep passing while silently testing the
+    # hash path instead of the model path. `test_resolve.py` names the same trap.
+    assert v["evidence_hash_matched"] is True,         "the hash short-circuit answered, not the model"
     return c, did
 
 
@@ -111,10 +117,16 @@ def test_withdraw_pays_once_and_leaves_nothing_behind(
         direct_vm, direct_deploy, direct_alice, direct_bob):
     """A credit is spendable exactly once.
 
-    The second call is the real assertion. `withdraw` zeroes the credit *before*
-    sending, so if that write were missing or ordered after the send, the same
-    bond could be collected repeatedly — and in direct mode, where the send is a
-    no-op, nothing else would notice.
+    The second call is the real assertion: it pins that the zeroing *happens*.
+
+    It does not pin the *ordering* of the zeroing against the send, and nothing
+    in direct mode can — the send is a silent no-op there, so it never raises,
+    so the credit is zeroed either way and both orderings produce identical
+    state. Swapping the two lines in the contract leaves this test green.
+    Ordering only becomes observable when a send fails, which neither direct
+    mode nor studionet's balance instruments can produce on demand; it is argued
+    instead from `_Payee`'s synchronous `.get()`, which reverts the caller's own
+    writes on failure.
     """
     c, _ = _resolved(direct_vm, direct_deploy, direct_alice, direct_bob,
                      "upheld")

@@ -2,7 +2,7 @@
 
 Two shims, both narrow, both with a stated delete-condition. Neither touches the
 contract: the contract deployed to studionet unmodified, and the linter's method
-count (16) matches what the network's own schema call returns.
+count (21) matches what the network's own schema call returns.
 
 1. The ASCII shim (load-bearing — nothing runs without it)
 ---------------------------------------------------------

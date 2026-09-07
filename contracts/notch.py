@@ -30,6 +30,12 @@ PRECEDENT_CAP = 5
 JUDGE_FIELDS = ("adjusted_atto", "case_id", "claim_kind",
                 "evidence_hash_matched", "outcome")
 
+# The unset value of `Statement.accepted_by`: nobody accepted, the window simply
+# lapsed. `bytes(20)` rather than a hex literal, and a named constant rather than
+# a bare comparison, because "no address" is a value this contract has to reason
+# about.
+NOBODY = Address(bytes(20))
+
 STATUS_OPEN = "open"
 STATUS_ACCEPTED = "accepted"
 STATUS_SETTLED = "settled"
@@ -72,6 +78,10 @@ class Statement:
     statement_hash: str
     status: str
     settle_ref: str
+    # Who explicitly agreed to this statement, or `NOBODY` if the window simply
+    # lapsed. Settlement history is booked against this address and no other —
+    # see `_record_settlement`.
+    accepted_by: Address
     legs: DynArray[str]
     notch_ids: DynArray[str]
 
@@ -194,6 +204,16 @@ class Notch(gl.Contract):
     def get_dispute_window_seconds(self) -> int:
         return self.dispute_window_seconds
 
+    @gl.public.view
+    def get_base_credit_atto(self) -> int:
+        """The third constructor parameter, readable like the other two.
+
+        Without it `credit_limit` cannot be explained from outside: for an address
+        with any history, `base + cleared // 10 - lost * base` is one equation in
+        two unknowns unless the caller also has this.
+        """
+        return self.base_credit_atto
+
     @gl.public.write
     def open_tab(self, tab_id: str, members: list[str], cycle_seconds: u256) -> None:
         # Checked before `tab exists`, because that guard uses this argument as a
@@ -220,19 +240,44 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} need two members")
         if cycle_seconds == 0:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} zero cycle")
+        # Every member address parsed before the first write, so a malformed one
+        # cannot leave a half-built tab behind. On a real network the revert would
+        # roll that back regardless — but direct mode does **not** roll back, so
+        # validating first is also what keeps the harness's behaviour honest
+        # rather than divergent from production.
+        addrs = [self._addr(m) for m in members]
         t = self.tabs.get_or_insert_default(tab_id)
         t.creator = gl.message.sender_address
         t.cycle_seconds = cycle_seconds
         t.cycle = u256(0)
         t.opened_at = gl.message_raw["datetime"]
-        for m in members:
-            t.members.append(Address(m))
+        for a in addrs:
+            t.members.append(a)
 
     def _member(self, t: Tab, who: Address) -> bool:
         for m in t.members:
             if m == who:
                 return True
         return False
+
+    def _addr(self, who: str) -> Address:
+        """Every party-supplied address string goes through here.
+
+        `Address.__init__` ends in `raise Exception(f'invalid address {val}')` — a
+        **bare** `Exception`, which the constraints forbid outright and which
+        carries none of spec §5's four prefixes, so validators comparing errors by
+        prefix match nothing. One helper rather than a guard at each of the five
+        call sites, so a sixth caller cannot forget.
+
+        Not a consensus hazard either way — these are deterministic guards that
+        run before any nondet work, so every node reverts identically — but the
+        prefix vocabulary is the mechanism the whole error design rests on, and a
+        method that leaks a bare exception is a hole in it.
+        """
+        try:
+            return Address(who)
+        except Exception:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} bad address")
 
     @gl.public.write
     def add_notch(self, tab_id: str, notch_id: str, payer: str, atto: u256,
@@ -256,7 +301,7 @@ class Notch(gl.Contract):
             c not in "0123456789abcdef" for c in evidence_hash
         ):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} bad evidence_hash")
-        p = Address(payer)
+        p = self._addr(payer)
         if p == payee:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} payer is payee")
         if not self._member(t, p):
@@ -335,6 +380,13 @@ class Notch(gl.Contract):
         s.statement_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         s.status = STATUS_OPEN
         s.settle_ref = ""
+        # Belt and braces, and measured as such: `get_or_insert_default` already
+        # zero-fills an `Address` field, and a statement id is never reused
+        # (`close` increments `t.cycle` before the next one), so deleting this line
+        # leaves the suite green. Kept because every other field on this record is
+        # set explicitly here, and because "unset" is load-bearing for this one —
+        # it is what `_record_settlement` reads as "nobody agreed".
+        s.accepted_by = NOBODY
         for i in sorted(ids):
             s.notch_ids.append(i)
         for leg in legs:
@@ -349,6 +401,10 @@ class Notch(gl.Contract):
                 "closed_by": s.closed_by.as_hex,
                 "statement_hash": s.statement_hash, "status": s.status,
                 "settle_ref": s.settle_ref,
+                # `NOBODY` (the zero address) means the window lapsed rather than
+                # anyone agreeing. Exposed because it decides whose settlement
+                # history this statement counts toward — see `_record_settlement`.
+                "accepted_by": s.accepted_by.as_hex,
                 "legs": [json.loads(x) for x in s.legs],
                 "notch_ids": [x for x in s.notch_ids]}
 
@@ -396,6 +452,11 @@ class Notch(gl.Contract):
         if gl.message.sender_address == s.closed_by:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} closer cannot accept")
         s.status = STATUS_ACCEPTED
+        # Recorded, not merely counted. This is the only affirmative signal any
+        # party ever gives about a statement, and `_record_settlement` needs to
+        # know *who* gave it rather than just that someone did — see the consent
+        # note there.
+        s.accepted_by = gl.message.sender_address
 
     @gl.public.write
     def file_settlement(self, statement_id: str, settle_ref: str) -> None:
@@ -415,32 +476,100 @@ class Notch(gl.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} not final")
         s.status = STATUS_SETTLED
         s.settle_ref = settle_ref
-        self._record_settlement(s)
+        self._record_settlement(statement_id, s)
 
-    def _record_settlement(self, s: Statement) -> None:
-        """Book a settled statement against each debtor's history.
+    def _record_settlement(self, statement_id: str, s: Statement) -> None:
+        """Book a settled statement against the history of whoever agreed to it.
 
-        Needs no guard of its own, unlike `_settle_bond`: `already settled` above
-        is a reachable, tested refusal on this statement's own status, and status
-        is exactly what this reads. A second filing cannot get here.
+        Needs no replay guard of its own, unlike `_settle_bond`: `already settled`
+        above is a reachable, tested refusal on this statement's own status, and
+        status is exactly what this reads. A second filing cannot get here.
 
-        Aggregated per debtor before writing, in two passes rather than one. A
-        debtor can appear in more than one leg — one per counterparty — so
-        incrementing inside the leg loop would count a single statement several
-        times, and `settled_count` means *statements*. `cleared_atto` sums either
-        way; it is written here too so both counters come from one walk of the
-        legs. Sorted for a deterministic write order.
+        Only `s.accepted_by` is credited, and that is a security property
+        ------------------------------------------------------------------
+        Nothing in this contract requires a party's consent to be *named* in a
+        tab. `open_tab` takes a member list and validates its shape, not its
+        agreement; `add_notch` puts no ceiling on `atto`; any member may `close`;
+        and a lapsed window auto-accepts under §4. So without this restriction a
+        stranger could open a tab naming a victim, bill them any amount, close,
+        wait out the window, file a receipt, and write an arbitrary `cleared_atto`
+        onto an address that never made a single call — a forged credit rating,
+        cross-tab and permanent, since nothing here ever decrements. That was
+        reproduced, not theorised.
+
+        `accept` is the one affirmative signal that exists: it refuses the closer
+        (§4 makes acceptance the *counterparty's* act), so an attacker cannot
+        supply it for a victim, and it cannot be forged from a second address the
+        attacker controls because only a debtor's own acceptance books that
+        debtor's history. Hence: credit the accepter, if the accepter owes
+        something on this statement, and nobody otherwise.
+
+        The cost is real and is the reason this is a narrowing rather than a pure
+        win: a statement that settles by silence builds no credit history for
+        anyone. Silence is enough to make the netting binding, which is what §4
+        asks of it — it is not enough to build a reputation, which is what §3
+        asks of this. The alternative is opt-in tab membership, a much larger
+        change to the tab model itself.
+
+        Consequences worth knowing before trusting a number from here
+        ------------------------------------------------------------
+        1. **A disputed statement books nothing, for anybody.** `accept` requires
+           `status == open` and `open_dispute` moves the status off it, so a
+           statement that went to judgment can never have been accepted. A cycle
+           that had to be adjudicated is therefore not a clean settlement in
+           either direction — which also removes the incentive inversion a review
+           found here: booking the *billed* leg amount would otherwise credit a
+           payer in full for a bill an `upheld` verdict excused them from, making
+           "be billed large and win" the cheapest way to raise a limit.
+        2. **A statement netted to exactly zero books nothing either.** `close()`
+           drops any pair whose signed total is 0, while its `nothing to close`
+           guard counts *notches*, so `A` billing `B` 1000 and `B` billing `A`
+           1000 produces a legitimate statement with no legs at all. There is no
+           volume to clear, so there is nothing to credit.
+        3. **`cleared_atto` is still only volume *claimed*.** §6 keeps obligations
+           off-chain and `settle_ref` is an unvalidated reference, so the contract
+           cannot verify that anything was actually paid. What this map now means
+           is "volume on statements this address agreed to", which is as strong a
+           claim as the design permits.
         """
+        # `statement_id` is taken as a parameter rather than rebuilt from
+        # `f"{s.tab_id}:{s.cycle}"`, which would be a second copy of `close()`'s
+        # id derivation, free to drift from the original.
         owed: dict[str, int] = {}
         for x in s.legs:
             leg = json.loads(x)
             owed[leg["debtor"]] = owed.get(leg["debtor"], 0) + int(leg["atto"])
-        for hex_addr in sorted(owed):
-            a = Address(hex_addr)
-            self.cleared_atto[a] = u256(
-                int(self.cleared_atto.get(a, u256(0))) + owed[hex_addr])
-            self.settled_count[a] = u256(
-                int(self.settled_count.get(a, u256(0))) + 1)
+        # Aggregated per debtor first: one debtor can owe two counterparties in a
+        # multilateral cycle, so `settled_count` would count a single statement
+        # twice if it were incremented per leg.
+        who = s.accepted_by.as_hex
+        # One lookup covers both refusals — an unaccepted statement leaves
+        # `accepted_by` as `NOBODY`, which is never a debtor on any leg, and an
+        # accepter who owes nothing on this statement is not in `owed` either.
+        if who not in owed:
+            return
+        a = self._addr(who)
+        # Saturating, not wrapping, and the clamp is not decorative. `u256` is
+        # `typing.NewType('u256', int)` — calling it is the identity function with
+        # no range check — and the real check happens later in the storage
+        # descriptor, as `val.to_bytes(32, ...)`, which raises a bare
+        # `OverflowError` for anything >= 2**256. Bare, so unprefixed, which is
+        # the one thing spec §5 cannot tolerate and which
+        # `_statement`/`_dispute`/`get_precedent` all exist to avoid. Reachable
+        # with no adversary, because `add_notch` puts no ceiling on `atto`: two
+        # payees billing one debtor 2**255 each in a cycle overflow the sum, and
+        # the revert is permanent — that statement could never be settled by
+        # anyone. Saturating keeps `file_settlement` always able to succeed, at a
+        # magnitude already 10^59 USDC past any real balance.
+        #
+        # `bond_credit` and `lost_count` need no such clamp: a bond is real
+        # attached value, bounded by what the claimant actually holds, and
+        # `lost_count` counts transactions. `cleared_atto` is the only counter
+        # that accumulates a figure nobody had to fund.
+        self.cleared_atto[a] = u256(min(
+            2**256 - 1, int(self.cleared_atto.get(a, u256(0))) + owed[who]))
+        self.settled_count[a] = u256(
+            int(self.settled_count.get(a, u256(0))) + 1)
 
     @gl.public.write.payable
     def open_dispute(self, statement_id: str, notch_ids: list[str],
@@ -1083,7 +1212,7 @@ class Notch(gl.Contract):
         honest reading of a key that was never written, and the alternative
         would have every caller guard a lookup that has a correct empty answer.
         """
-        return int(self.bond_credit.get(Address(who), u256(0)))
+        return int(self.bond_credit.get(self._addr(who), u256(0)))
 
     @gl.public.write
     def withdraw(self) -> None:
@@ -1095,9 +1224,13 @@ class Notch(gl.Contract):
         who = gl.message.sender_address
         amount = int(self.bond_credit.get(who, u256(0)))
         if amount == 0:
-            # Also load-bearing beyond the message: `emit_transfer` raises a
-            # bare `ValueError` on a non-positive value, and a ValueError here is
-            # a VM error rather than a prefixed one.
+            # This guard is the *only* thing preventing a zero-value `EthSend`.
+            # `gl.get_contract_at(...).emit_transfer` does refuse a non-positive
+            # value with a bare `ValueError`, but that is the API `_Payee` exists
+            # to avoid; the EVM interface's `emit_transfer` is
+            # `self._transfer(self, data)` straight through to `EthSend` with no
+            # range check anywhere on the path. So nothing downstream will catch
+            # a zero for us.
             raise gl.vm.UserError(f"{ERROR_EXPECTED} nothing to withdraw")
         # Zeroed before the send, and safe to do so *because* the send is
         # synchronous: if it fails it raises, and this write reverts with it.
@@ -1133,7 +1266,7 @@ class Notch(gl.Contract):
         no method keeps today, plus a rule for notches already accrued when a
         dispute is lost — real work, and out of this task's scope.
         """
-        a = Address(who)
+        a = self._addr(who)
         base = int(self.base_credit_atto)
         earned = int(self.cleared_atto.get(a, u256(0))) // 10
         penalty = int(self.lost_count.get(a, u256(0))) * base
@@ -1148,7 +1281,7 @@ class Notch(gl.Contract):
         what makes `settled_count` real data instead of a write-only field: the
         formula does not read it, §3 names it, and this is where it surfaces.
         """
-        a = Address(who)
+        a = self._addr(who)
         return {"settled_count": int(self.settled_count.get(a, u256(0))),
                 "lost_count": int(self.lost_count.get(a, u256(0))),
                 "cleared_atto": int(self.cleared_atto.get(a, u256(0))),

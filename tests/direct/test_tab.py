@@ -71,3 +71,28 @@ def test_guards(direct_vm, direct_deploy, direct_alice, direct_bob,
         c.get_notch("nope")
     with direct_vm.expect_revert("[EXPECTED] no such tab"):
         c.get_tab("nope")
+
+
+def test_a_malformed_address_is_refused_with_a_prefix(direct_vm, direct_deploy,
+                                                      direct_alice, direct_bob):
+    """Every party-supplied address string routes through one guard.
+
+    `Address.__init__` ends in `raise Exception(f'invalid address {val}')` — bare,
+    so unprefixed, so it matches none of spec §5's four prefixes. `open_tab` and
+    `add_notch` are the two write paths that take an address as text.
+    """
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
+    direct_vm.sender = direct_alice
+
+    with direct_vm.expect_revert("[EXPECTED] bad address"):
+        c.open_tab("bad", [hex_of(direct_alice), "not-an-address"], 86400)
+    # Nothing was written: the addresses are parsed before the first store, so a
+    # rejected member does not leave a half-built tab under that id. Worth
+    # asserting rather than assuming — direct mode does not roll back a revert,
+    # so a validate-after-write order would leave `bad` readable here.
+    with direct_vm.expect_revert("[EXPECTED] no such tab"):
+        c.get_tab("bad")
+
+    c.open_tab("t1", [hex_of(direct_alice), hex_of(direct_bob)], 86400)
+    with direct_vm.expect_revert("[EXPECTED] bad address"):
+        c.add_notch("t1", "n1", "0x1234", 1000, "memo", URI, H, "off_spec")

@@ -204,10 +204,11 @@ def test_a_statement_counts_once_even_with_two_debtor_legs(
     sid = c.close("t1")
     assert len(c.get_statement(sid)["legs"]) == 2, "expected two debtor legs"
 
-    # Nobody accepts, so the window closing is what makes it final — the
-    # auto-accept path, which is how a real cycle settles most of the time.
-    past_window(direct_vm, c, sid)
+    # `bob` accepts explicitly. History is booked only against the address that
+    # affirmatively agreed, so the auto-accept path would book nothing here — see
+    # `test_a_statement_settled_by_silence_books_no_history`.
     direct_vm.sender = direct_bob
+    c.accept(sid)
     c.file_settlement(sid, "0xreceipt")
 
     h = c.get_credit_history(hex_of(direct_bob))
@@ -254,3 +255,195 @@ def test_filing_a_receipt_twice_cannot_double_count(
     h = c.get_credit_history(hex_of(direct_bob))
     assert h["settled_count"] == 1, h
     assert h["cleared_atto"] == HUNDRED, h
+
+
+# --- the edges the review found -----------------------------------------------
+
+
+def test_an_overflowing_total_saturates_instead_of_bricking_the_statement(
+        direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    """`cleared_atto` saturates at `2**256 - 1` rather than raising.
+
+    `u256(...)` is `typing.NewType('u256', int)` — the identity function, no range
+    check — and the real check is `val.to_bytes(32, ...)` inside the storage
+    descriptor, which raises a bare **`OverflowError`**. Bare means unprefixed,
+    which is the one error shape spec §5 cannot work with.
+
+    Reachable with no adversary and no hostile validator, because `add_notch` puts
+    no ceiling on `atto`: two payees billing the same debtor `2**255` each in one
+    cycle sum to exactly `2**256`. Before the clamp this reverted, and reverted
+    *permanently* — the statement could never be settled by anyone, with no
+    recovery path. Saturating is what keeps `file_settlement` always able to
+    succeed; the precision lost is at a magnitude 10^59 USDC beyond any real
+    balance.
+    """
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
+    direct_vm.sender = direct_alice
+    c.open_tab("t1", [hex_of(direct_alice), hex_of(direct_bob),
+                      hex_of(direct_charlie)], 86400)
+    c.add_notch("t1", "n1", hex_of(direct_bob), 2**255, "a", URI, GOOD_H,
+                "off_spec")
+    direct_vm.sender = direct_charlie
+    c.add_notch("t1", "n2", hex_of(direct_bob), 2**255, "b", URI, GOOD_H,
+                "off_spec")
+    sid = c.close("t1")
+    # Both legs name `bob`, so `_record_settlement` sums them to 2**256.
+    assert len(c.get_statement(sid)["legs"]) == 2
+
+    direct_vm.sender = direct_bob
+    c.accept(sid)
+    c.file_settlement(sid, "0x")           # must not raise
+
+    assert c.get_credit_history(hex_of(direct_bob))["cleared_atto"] == 2**256 - 1
+    assert c.get_statement(sid)["status"] == "settled"
+
+
+def test_a_malformed_address_gets_a_prefixed_error_from_the_views(
+        direct_vm, direct_deploy, direct_alice, direct_bob):
+    """`Address()` raises a bare `Exception`; every caller path wraps it.
+
+    The constraints forbid a bare exception outright, and spec §5 has validators
+    compare errors by prefix — an unprefixed one matches nothing. These are views
+    and therefore not a consensus hazard in themselves, but the prefix vocabulary
+    is the mechanism the whole error design rests on.
+    """
+    c = _tab(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    for bad in ("bob", "0x1234", "", "0x" + "z" * 40):
+        with direct_vm.expect_revert("[EXPECTED] bad address"):
+            c.credit_limit(bad)
+        with direct_vm.expect_revert("[EXPECTED] bad address"):
+            c.get_credit_history(bad)
+        with direct_vm.expect_revert("[EXPECTED] bad address"):
+            c.get_bond_credit(bad)
+
+
+def test_the_deployed_base_is_readable(direct_vm, direct_deploy, direct_alice,
+                                       direct_bob):
+    """`credit_limit` cannot be explained from outside without it.
+
+    For an address with any history, `base + cleared // 10 - lost * base` is one
+    equation in two unknowns. The other two constructor parameters both have
+    getters; this one was missing.
+    """
+    c = _tab(direct_vm, direct_deploy, direct_alice, direct_bob)
+    assert c.get_base_credit_atto() == BASE
+
+
+# --- consent: whose history is this, anyway? ----------------------------------
+
+
+def test_a_stranger_cannot_forge_your_credit_history(
+        direct_vm, direct_deploy, direct_alice, direct_charlie):
+    """The finding this restriction exists for. Reproduced before it was closed.
+
+    Nothing requires a party's consent to be *named* in a tab: `open_tab`
+    validates the member list's shape, not its agreement; `add_notch` puts no
+    ceiling on `atto`; any member may `close`; and a lapsed window auto-accepts.
+    So `alice` alone can run the whole lifecycle against `charlie` and, before the
+    fix, write an arbitrary `cleared_atto` onto an address that never made a
+    single call — a forged credit rating, cross-tab and permanent, since nothing
+    ever decrements it.
+
+    `charlie` makes no call anywhere in this test. That is the point.
+    """
+    c = direct_deploy("contracts/notch.py", BOND, 3600, BASE)
+    direct_vm.sender = direct_alice
+    c.open_tab("grief", [hex_of(direct_alice), hex_of(direct_charlie)], 86400)
+    c.add_notch("grief", "n1", hex_of(direct_charlie), 10**30, "invented", URI,
+                GOOD_H, "off_spec")
+    sid = c.close("grief")
+    past_window(direct_vm, c, sid)
+    c.file_settlement(sid, "0x")
+
+    assert c.get_statement(sid)["status"] == "settled"
+    assert c.get_credit_history(hex_of(direct_charlie)) == {
+        "settled_count": 0, "lost_count": 0, "cleared_atto": 0,
+        "credit_limit": BASE}
+    assert c.credit_limit(hex_of(direct_charlie)) == BASE
+
+
+def test_a_statement_settled_by_silence_books_no_history(
+        direct_vm, direct_deploy, direct_alice, direct_bob):
+    """The cost of the rule above, asserted rather than left implicit.
+
+    Silence is enough to make the netting binding — §4 says so, and
+    `file_settlement` still succeeds here — but it is not enough to build a
+    reputation. An agent that wants credit has to say so.
+    """
+    c = _tab(direct_vm, direct_deploy, direct_alice, direct_bob)
+    sid = _bill_and_close(direct_vm, c, direct_alice, direct_bob, "n1", HUNDRED)
+    past_window(direct_vm, c, sid)
+    direct_vm.sender = direct_bob
+    c.file_settlement(sid, "0xreceipt")
+
+    assert c.get_statement(sid)["status"] == "settled"
+    assert c.get_credit_history(hex_of(direct_bob))["settled_count"] == 0
+    assert c.credit_limit(hex_of(direct_bob)) == BASE
+
+
+def test_a_disputed_statement_books_no_volume_for_the_winner(
+        direct_vm, direct_deploy, direct_alice, direct_bob):
+    """A cycle that went to judgment is not a clean settlement in either direction.
+
+    This is the interaction that makes a separate fix unnecessary. A review found
+    that booking the *billed* leg amount would credit a payer in full for a bill
+    an `upheld` verdict excused them from — making "be billed large and win" the
+    cheapest way to raise a limit, the exact inverse of §1's "pay clean, run a
+    bigger tab".
+
+    It cannot happen, and the reason is structural rather than arithmetic:
+    `accept` requires `status == open`, and `open_dispute` moves the status off
+    `open` permanently (`disputed`, then `resolved`). So a statement that was
+    disputed can never have been accepted, `accepted_by` stays `NOBODY`, and
+    nothing is booked for anyone. Netting the excused amount out of the booked
+    volume would therefore be unreachable code.
+
+    `bob` wins here — 100 USDC billed, `upheld`, so `bob` owes nothing — and ends
+    with the same limit as an agent with no history at all.
+    """
+    c = _tab(direct_vm, direct_deploy, direct_alice, direct_bob)
+    sid = _bill_and_close(direct_vm, c, direct_alice, direct_bob, "n1", HUNDRED)
+
+    direct_vm.sender = direct_bob
+    direct_vm.value = BOND
+    c.open_dispute(sid, ["n1"], "off_spec", "never delivered")
+    direct_vm.value = 0
+    _serves(direct_vm)
+    direct_vm.mock_llm(r".*", _verdict(outcome="upheld"))
+    v = c.resolve(sid + "#d")
+    assert v["outcome"] == "upheld" and v["adjusted_atto"] == 0
+
+    # The statement is off `disputed`, so it can go final and be settled...
+    past_window(direct_vm, c, sid)
+    c.file_settlement(sid, "0xreceipt")
+    assert c.get_statement(sid)["status"] == "settled"
+    # ...and it cannot have been accepted, so no volume is booked.
+    assert c.get_statement(sid)["accepted_by"] == "0x" + "00" * 20
+    assert c.get_credit_history(hex_of(direct_bob))["cleared_atto"] == 0
+    assert c.credit_limit(hex_of(direct_bob)) == BASE
+
+    # `alice` lost the dispute, so the penalty lands there and nowhere else.
+    assert c.get_credit_history(hex_of(direct_alice))["lost_count"] == 1
+    assert c.credit_limit(hex_of(direct_alice)) == 0
+
+
+def test_accepting_does_not_book_history_for_a_non_debtor(
+        direct_vm, direct_deploy, direct_alice, direct_bob):
+    """The accepter is credited only for what the accepter actually owes.
+
+    `alice` is the creditor on this statement. If she were the one accepting — she
+    cannot be here, since she closed it, but a third member could be — there is no
+    leg naming her as debtor, so `owed` has no entry and nothing is written. The
+    guard is one `in` test that covers this and the unaccepted case together.
+    """
+    c = _tab(direct_vm, direct_deploy, direct_alice, direct_bob)
+    sid = _bill_and_close(direct_vm, c, direct_alice, direct_bob, "n1", HUNDRED)
+    direct_vm.sender = direct_bob
+    c.accept(sid)
+    c.file_settlement(sid, "0xreceipt")
+
+    # bob owed, so bob is credited; alice was owed, so alice is not.
+    assert c.get_credit_history(hex_of(direct_bob))["cleared_atto"] == HUNDRED
+    assert c.get_credit_history(hex_of(direct_alice))["cleared_atto"] == 0
+    assert c.get_credit_history(hex_of(direct_alice))["settled_count"] == 0
