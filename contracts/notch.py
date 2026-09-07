@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from genlayer import *
 
 ERROR_EXPECTED = "[EXPECTED]"
+# Spec §5's four-prefix vocabulary, kept whole. `[EXTERNAL]` is deliberately
+# raised nowhere: this contract's only external call is the evidence fetch, and
+# `_leader` classifies every failure of it as `[TRANSIENT]` (retryable) or as
+# §5.2 "unreachable" (a verdict), so no site needs it. Defined so a future
+# external dependency reaches for the spec's name rather than inventing a fifth.
 ERROR_EXTERNAL = "[EXTERNAL]"
 ERROR_TRANSIENT = "[TRANSIENT]"
 ERROR_LLM = "[LLM_ERROR]"
@@ -726,10 +731,11 @@ class Notch(gl.Contract):
         """Does this validator accept the leader's verdict?
 
         The equivalence rule. It is **comparative**: the validator re-runs the
-        whole leader function — re-fetching the evidence, re-hashing it,
-        re-asking the model — and compares outcomes. A schema-only check would
-        confirm the leader returned well-formed JSON and nothing else, which
-        would let one node decide a settlement alone.
+        whole leader function — re-fetching the evidence, re-hashing it, and,
+        unless the hash already decided the dispute on its own, re-asking the
+        model — and compares outcomes. A schema-only check would confirm the
+        leader returned well-formed JSON and nothing else, which would let one
+        node decide a settlement alone.
 
         Compared: `outcome` and `evidence_hash_matched` exactly, `adjusted_atto`
         exactly unless the outcome is `adjusted`, where a ±1% band absorbs two
@@ -741,7 +747,8 @@ class Notch(gl.Contract):
         Not compared: `rationale` and `cited_case_ids`. Spec §5 stores them as
         metadata and excludes them from the comparison; two honest validators
         phrase prose differently, and comparing it would fail consensus for no
-        gain.
+        gain. Their *presence* and shape are still checked, which is not the
+        same thing as comparing them — see the guard below.
 
         Disagreement is cheap — it costs a consensus round — so every uncertain
         case resolves to False. What it cannot do is agree wrongly.
@@ -764,16 +771,31 @@ class Notch(gl.Contract):
             # to endorse a settlement we could not derive, so refuse and let the
             # next round decide.
             return False
-        # A leader whose result is missing a field is not a leader to agree
-        # with. Read through `.get` rather than subscripting: a bare `KeyError`
-        # carries an empty message, and while an exception escaping a validator
-        # is already treated as `Disagree` by the executor, that turns a clean
-        # disagreement into a validator error and loses the reason.
+        # A leader whose result is the wrong shape is not a leader to agree with.
+        # `theirs` is `calldata.decode`'s output — a plain dict, never a
+        # `TreeMap` — so a bad subscript here raises `KeyError('outcome')`
+        # carrying the key. That still matches none of the four prefixes, and
+        # while an exception escaping a validator is already treated as
+        # `Disagree` by the executor, it turns a clean disagreement into a
+        # validator error and loses the reason. Hence: refuse, never raise.
+        #
+        # The loop covers all five fields, not just the three compared ones.
+        # `rationale` and `cited_case_ids` stay out of the *comparison* per spec
+        # §5, but `resolve()` subscripts both once consensus has agreed, so a
+        # leader omitting one would revert every honest node *after* the vote —
+        # freezing the statement and stranding the bond, with the leader free to
+        # repeat it. Requiring a field is not comparing it.
         if not isinstance(theirs, dict):
             return False
-        for field in ("outcome", "adjusted_atto", "evidence_hash_matched"):
+        for field in ("outcome", "adjusted_atto", "evidence_hash_matched",
+                      "rationale", "cited_case_ids"):
             if field not in theirs:
                 return False
+        if not isinstance(theirs["cited_case_ids"], list):
+            # `for x in 5` is a TypeError in `resolve()`, which is that same
+            # post-consensus revert by another route. A str would iterate into
+            # per-character case ids instead of crashing, which is worse.
+            return False
 
         if bool(theirs["evidence_hash_matched"]) != bool(mine["evidence_hash_matched"]):
             return False
@@ -785,11 +807,14 @@ class Notch(gl.Contract):
             return False
         if mine["outcome"] != "adjusted":
             return a == b                      # pinned to 0 or total, must match
-        # No zero short-circuit: `adjusted_atto` is clamped non-negative by
-        # `_parse_verdict`, so `max(a, b) == 0` implies both are 0, and the
-        # comparison below already answers `0 <= 0`. A guard for it would be a
-        # branch no input can distinguish — and mutation-testing it proved
-        # exactly that, which is why it is a comment instead of code.
+        # No zero short-circuit. On the honest path `_parse_verdict` clamps both
+        # sides non-negative, so `max(a, b) == 0` means both are 0 and the
+        # comparison below already answers `0 <= 0`. A byzantine `theirs` can be
+        # negative, and that resolves correctly too rather than by luck: with
+        # `mine = b >= 0` guaranteed, `abs(a - b) == b + |a| > b == max(a, b)`,
+        # so the band refuses every negative amount. A guard for the zero case
+        # would therefore be a branch no input can distinguish — mutation-testing
+        # it proved exactly that, which is why it is a comment instead of code.
         #
         # Integer arithmetic, deliberately: the constraints forbid floats, and a
         # consensus threshold computed in binary floating point is a threshold
@@ -799,10 +824,12 @@ class Notch(gl.Contract):
     def _agree_on_error(self, leaders_res, leader_fn) -> bool:
         """The leader failed. Do we fail the same way?
 
-        Spec §5: deterministic errors must match exactly, transient errors
-        agree, LLM errors always disagree to force rotation. The prefixes are
-        the whole mechanism, which is why every guard in this contract carries
-        one and why their exact text is asserted by tests.
+        Spec §5 gives three cases: deterministic errors must match exactly,
+        transient errors agree, LLM errors always disagree to force rotation.
+        Only the last two are implemented here, because only those two can cross
+        the nondet boundary — the comment on the branch below carries the proof.
+        The prefixes are the whole mechanism, which is why every guard in this
+        contract carries one and why their exact text is asserted by tests.
         """
         leader_msg = getattr(leaders_res, "message", "")
         try:
@@ -811,11 +838,21 @@ class Notch(gl.Contract):
             return False
         except gl.vm.UserError as e:
             mine = getattr(e, "message", str(e))
-            if mine.startswith(ERROR_EXPECTED) or mine.startswith(ERROR_EXTERNAL):
-                # Deterministic: same inputs, same error, character for
-                # character. A typo in a guard message is a consensus bug, not a
-                # cosmetic one.
-                return mine == leader_msg
+            # ponytail: no `[EXPECTED]`/`[EXTERNAL]` arm here, and spec §5's
+            # "deterministic errors must match exactly" still holds — upstream,
+            # by construction rather than by comparison. Every deterministic
+            # guard in this contract raises in a public method or a view, all of
+            # which run *before* `run_nondet_unsafe` (`resolve`'s own `already
+            # resolved` check is the nearest one). Those revert identically on
+            # every node with no leader result to compare, so a deterministic
+            # error cannot reach this method: the only prefixes `_leader` can
+            # raise are `[TRANSIENT]` and `[LLM_ERROR]`, and `[EXTERNAL]` is
+            # raised nowhere in the file. An exact-match arm was written here
+            # first; four separate mutations of it, deleting it outright
+            # included, all left the suite green. That measurement is what
+            # removed it. Add an `[EXPECTED]` raise inside `_leader` and you must
+            # restore the comparison — the fall-through below rotates instead,
+            # which is safe but burns a round.
             if mine.startswith(ERROR_TRANSIENT) and leader_msg.startswith(ERROR_TRANSIENT):
                 # Both hit a flaky fetch. Neither has grounds to rule, and both
                 # know it — agreeing here reverts the transaction cleanly instead
@@ -860,8 +897,22 @@ class Notch(gl.Contract):
         d.outcome = v["outcome"]
         d.adjusted_atto = u256(int(v["adjusted_atto"]))
         d.evidence_hash_matched = bool(v["evidence_hash_matched"])
-        d.rationale = v["rationale"]
-        for cid in v["cited_case_ids"]:
+        # Re-clamped with `_parse_verdict`'s own caps rather than trusted. Spec §5
+        # keeps these two fields out of the comparison, so `_agree` checks that
+        # the leader supplied them and that the ids are a list, but never what
+        # they contain — which leaves a byzantine leader free to send 200k of
+        # prose that every honest node then writes to storage twice, here and
+        # again inside `_record_precedent`. These caps are what keeps
+        # `_parse_verdict`'s "nothing reaches storage unbounded" true of the
+        # post-consensus path too, and they are the same two limits it applies.
+        #
+        # Both caps survive mutation and that is structural, not an untested
+        # guard: direct mode's `v` is always the real `_leader`'s return, which
+        # has already been through `_parse_verdict`'s identical caps, so no
+        # reachable input can tell the capped form from the uncapped one. Only a
+        # byzantine leader can, and neither direct mode nor GLSim runs one.
+        d.rationale = str(v["rationale"])[:2000]
+        for cid in [str(x)[:64] for x in v["cited_case_ids"]][:PRECEDENT_CAP]:
             d.cited.append(cid)
         # This write is what unfreezes finality: `_is_final` holds a `disputed`
         # statement non-final forever, so without it the statement and the bond

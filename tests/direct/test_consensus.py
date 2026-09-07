@@ -22,9 +22,7 @@ faster and cover more branches; that one proves the harness is not the thing
 making them pass.
 """
 
-import json
-
-from conftest import BOND, GOOD_H, URI, _disputed, _serves, _verdict, hex_of
+from conftest import _disputed, _serves, _verdict
 
 
 def _resolved(direct_vm, direct_deploy, a, b, **verdict):
@@ -209,7 +207,13 @@ def test_the_band_refuses_one_atto_past_the_boundary(direct_vm, direct_deploy,
 
 def test_two_zero_adjustments_agree(direct_vm, direct_deploy, direct_alice,
                                     direct_bob):
-    """`max(a, b) == 0` would divide by zero in a percentage. It short-circuits."""
+    """Both sides at zero agree, with no special case in the code doing it.
+
+    `adjusted` is the one outcome that reaches the band, and `0 == 0` falls out
+    of `abs(0 - 0) * 100 <= max(0, 0)` on its own. There is no short-circuit and
+    no division to guard — the form is multiplicative — so this test exists to
+    pin that the zero case needs neither.
+    """
     c, _, _, _ = _resolved(direct_vm, direct_deploy, direct_alice, direct_bob,
                            outcome="adjusted", adjusted_atto=0)
 
@@ -246,15 +250,54 @@ def test_a_leader_result_missing_a_field_disagrees(direct_vm, direct_deploy,
                                                    direct_alice, direct_bob):
     """Disagree, never raise.
 
-    A subscript here would raise a `KeyError` carrying an empty message. The
-    executor treats a validator exception as `Disagree`, so the direction is
-    already safe — but it turns a clean refusal into a validator error and loses
-    the reason.
+    `theirs` is `calldata.decode`'s plain dict, so a subscript here would raise
+    `KeyError('adjusted_atto')`. The executor treats a validator exception as
+    `Disagree`, so the direction is already safe — but it turns a clean refusal
+    into a validator error and loses the reason.
     """
     c, _, _, _ = _resolved(direct_vm, direct_deploy, direct_alice, direct_bob)
 
     assert direct_vm.run_validator(leader_result={
         "outcome": "rejected", "rationale": "no amount here"}) is False
+
+
+def test_a_leader_result_missing_uncompared_metadata_disagrees(
+        direct_vm, direct_deploy, direct_alice, direct_bob):
+    """The fields spec §5 will not let us compare still have to be *there*.
+
+    Both payloads below carry a correct, agreeable verdict — right outcome, right
+    amount, right hash flag — and omit only a field the rule is forbidden to
+    compare. Agreeing would pass consensus and then revert every honest node at
+    `resolve()`'s subscript, freezing the statement and stranding the bond with
+    the leader free to do it again. Presence is checked; contents are not.
+    """
+    c, _, _, _ = _resolved(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    assert direct_vm.run_validator(leader_result={
+        "outcome": "rejected", "adjusted_atto": 1000,
+        "evidence_hash_matched": True,
+        "cited_case_ids": []}) is False
+    assert direct_vm.run_validator(leader_result={
+        "outcome": "rejected", "adjusted_atto": 1000,
+        "evidence_hash_matched": True,
+        "rationale": "x"}) is False
+
+
+def test_non_list_cited_case_ids_disagrees(direct_vm, direct_deploy,
+                                           direct_alice, direct_bob):
+    """A `cited_case_ids` that is not a list is the same revert by another route.
+
+    `for x in 5` is a `TypeError` in `resolve()`. The string case is worse than a
+    crash rather than better: it would iterate into one case id per character and
+    store them, so both are refused here.
+    """
+    c, _, _, _ = _resolved(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    for cited in (5, "t9:0#d", {"t9:0#d": True}, None):
+        assert direct_vm.run_validator(leader_result={
+            "outcome": "rejected", "adjusted_atto": 1000,
+            "evidence_hash_matched": True,
+            "rationale": "x", "cited_case_ids": cited}) is False
 
 
 def test_a_non_dict_leader_result_disagrees(direct_vm, direct_deploy,
@@ -306,41 +349,6 @@ def test_two_transient_failures_agree(direct_vm, direct_deploy, direct_alice,
     _serves(direct_vm, status=503, body="")
     assert direct_vm.run_validator(
         leader_error=Exception("[TRANSIENT] evidence 503")) is True
-
-
-def test_an_identical_deterministic_error_agrees(direct_vm, direct_deploy,
-                                                 direct_alice, direct_bob):
-    """Same inputs, same guard, same message — character for character."""
-    c, sid, did = _disputed(direct_vm, direct_deploy, direct_alice, direct_bob)
-    _serves(direct_vm)
-    direct_vm.mock_llm(r".*", "not json at all")
-    with direct_vm.expect_revert("[LLM_ERROR]"):
-        c.resolve(did)
-
-    # A guard both sides would hit identically: the dispute is already resolved.
-    direct_vm.clear_mocks()
-    _serves(direct_vm)
-    direct_vm.mock_llm(r".*", _verdict())
-    c.resolve(did)
-    assert direct_vm.run_validator(
-        leader_error=Exception("[EXPECTED] already resolved")) is False
-
-
-def test_a_differing_deterministic_error_disagrees(direct_vm, direct_deploy,
-                                                   direct_alice, direct_bob):
-    """A deterministic error that does not match exactly is a disagreement.
-
-    Both messages carry `[EXPECTED]`, so only the text separates them. This is
-    what makes a typo in a guard message a consensus bug rather than a cosmetic
-    one — and why every guard in this contract has a test pinning its exact text.
-    """
-    c, sid, did = _disputed(direct_vm, direct_deploy, direct_alice, direct_bob)
-    _serves(direct_vm)
-    direct_vm.mock_llm(r".*", _verdict())
-    c.resolve(did)
-
-    assert direct_vm.run_validator(
-        leader_error=Exception("[EXPECTED] no such dispute")) is False
 
 
 def test_an_llm_error_always_disagrees(direct_vm, direct_deploy, direct_alice,
