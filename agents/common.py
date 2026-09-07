@@ -128,6 +128,157 @@ def client_for(account):
     return create_client(chain=studionet, account=account)
 
 
+def contract_source() -> bytes:
+    """The contract as bytes, line endings normalised to LF.
+
+    **LF is this file's canonical form.** `.gitattributes` marks
+    `*.py text eol=lf`, so the committed blob is LF while the Windows worktree is
+    CRLF (68,837 bytes against 70,125 — 1288 line endings). Deploying the
+    normalised bytes makes the on-chain source byte-identical to what
+    `git cat-file blob HEAD:contracts/notch.py` returns, so a reader can diff the
+    deployed code against the repo with no line-ending caveat.
+
+    This is not enough to fit on Bradbury — see `testnet_source()`, which is over
+    the rollup's pubdata cap by ~16KB rather than by 199 bytes. An earlier version
+    of this docstring claimed the CRLF/LF difference was "the entire difference
+    between deployable and not"; that came from a broken probe and is false.
+    """
+    return CONTRACT.read_bytes().replace(b"\r\n", b"\n")
+
+
+def testnet_source() -> bytes:
+    """`contract_source()` with `#` comments removed. For Bradbury only.
+
+    **Why this exists.** Bradbury is a ZK rollup with a per-block pubdata budget,
+    and this contract does not fit. Measured by binary search against real source
+    (not compressible padding, which gives a nonsense answer): the ceiling is
+    **~53,000 bytes** and `contracts/notch.py` is **68,837**, over by ~16KB.
+    `eth_estimateGas` refuses with `invalid transaction:
+    BlockPubdataLimitReached`, deterministically — 23 consecutive attempts over
+    ~8 minutes all failed, so this is not congestion to wait out.
+
+    **What is removed, and what is deliberately kept.** Comments only: 24,923
+    bytes of them, taking the source to ~44KB with real headroom. **Every
+    docstring survives**, all 13,930 bytes, because a docstring is part of the
+    program — it is in the deployed module and readable via `genlayer code
+    <address>` — whereas a comment is not. So the reasoning a reader most needs
+    stays on chain, and only the annotations that were never in the runtime
+    object are dropped.
+
+    **The line-1 `Depends` header is preserved**, because it is a comment that is
+    also the runner directive, and stripping it would deploy against no runner at
+    all. The result keeps the required shape — header, blank line, imports —
+    which also sidesteps the recorded trap that a multi-line comment block
+    immediately after the header makes the network reject the contract outright
+    (`invalid_contract`, empty stderr).
+
+    **`contracts/notch.py` is not modified.** This is a build-time transform on
+    bytes in memory, so the reviewed, gated artifact is untouched and the
+    integration suite does not need re-running. studionet deploys the full source
+    — only Bradbury gets this — and the transform is deterministic, so anyone can
+    regenerate the deployed bytes from the repo and diff them.
+    """
+    import io
+    import tokenize
+
+    src = contract_source().decode("utf-8")
+    # Blank out every comment span except the line-1 runner header.
+    lines = src.splitlines()
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type != tokenize.COMMENT or tok.start[0] == 1:
+            continue
+        row, col = tok.start[0] - 1, tok.start[1]
+        lines[row] = lines[row][:col].rstrip()
+    # Drop the lines that were comment-only and are now empty. Blank lines are
+    # never syntactically required in Python, and dropping them is where the
+    # remaining size comes from. **Lines 1 and 2 are kept unconditionally**: the
+    # runner header, then the blank line after it. That blank is load-bearing per
+    # a recorded trap — the shape must stay *header, blank, imports*, and the
+    # first version of this function dropped the blank and put `import datetime`
+    # directly under the header.
+    kept = [ln for i, ln in enumerate(lines) if i < 2 or ln.strip()]
+    out = ("\n".join(kept) + "\n").encode("utf-8")
+    # Asserted rather than hoped: a transform that produced unparseable source
+    # would otherwise surface as an opaque on-chain `invalid_contract`.
+    import ast
+
+    ast.parse(out.decode("utf-8"))
+    assert out.split(b"\n", 1)[0].startswith(b'# { "Depends"'), "lost the runner header"
+    return out
+
+
+def succeeded(receipt) -> bool:
+    """Did the contract code actually run? Handles both receipt shapes.
+
+    ACCEPTED and FINALIZED are lifecycle states, not success: a reverted call
+    finalizes too, with every validator agreeing about the error, so a vote count
+    alone looks healthy.
+
+    **studionet** reports it at
+    `consensus_data.leader_receipt[0].execution_result == "SUCCESS"`, same check
+    `gltest.assertions` makes.
+
+    **Bradbury** has a different receipt entirely — `consensus_data` is an empty
+    dict, `leader_receipt` and `tx_data_decoded` are absent, and the answer lives
+    in `tx_execution_result_name`, which reads `FINISHED_WITH_RETURN` on success.
+    Reading only the studionet shape there reports a perfectly good deploy as
+    failed, which is exactly what happened the first time.
+    """
+    lr = (receipt.get("consensus_data") or {}).get("leader_receipt") or []
+    if lr:
+        return lr[0].get("execution_result") == "SUCCESS"
+    name = receipt.get("tx_execution_result_name")
+    return name in ("FINISHED_WITH_RETURN", "SUCCESS")
+
+
+def deployed_address(receipt) -> str:
+    """The new contract's address, from whichever field carries it.
+
+    `gltest.utils.extract_contract_address` reads `tx_data_decoded` or `data`,
+    and Bradbury populates neither — it puts the new address in `recipient`.
+    Verified against a live deploy: reading `get_bond_atto` and the other two
+    getters off that address returned the constructor arguments.
+    """
+    for holder in ("tx_data_decoded", "data"):
+        block = receipt.get(holder)
+        if isinstance(block, dict) and block.get("contract_address"):
+            return block["contract_address"]
+    if receipt.get("recipient"):
+        return receipt["recipient"]
+    raise RuntimeError(f"no contract address in receipt: {sorted(receipt.keys())}")
+
+
+def read_view(client, address, account, fn, *args):
+    """A view call that works on both networks.
+
+    genlayer_py 0.16.3's `read_contract` does `"0x" + enc_result` on the `gen_call`
+    result (`contracts/actions.py:86`). studionet returns a bare hex string, so
+    that works. **Bradbury returns a dict** — `{data, status, stdout, stderr,
+    logs, eqOutputs}` — and the concatenation raises
+    `TypeError: can only concatenate str (not "dict") to str` before any decode.
+    So the request is issued directly here and the envelope unwrapped, checking
+    `status.code` on the way, which the library's happy path never sees.
+
+    Delete this once `read_contract` handles the dict form.
+    """
+    from genlayer_py.contracts.actions import calldata, make_calldata_object, serialize
+    from genlayer_py.types import TransactionHashVariant
+
+    data = [calldata.encode(make_calldata_object(method=fn, args=list(args),
+                                                 kwargs=None)), b"\x00"]
+    res = client.provider.make_request(method="gen_call", params=[{
+        "type": "read", "to": address, "from": account.address,
+        "data": serialize(data),
+        "transaction_hash_variant": TransactionHashVariant.LATEST_NONFINAL.value,
+    }])["result"]
+    if isinstance(res, dict):
+        status = res.get("status") or {}
+        if status.get("code") != 0:
+            raise RuntimeError(f"{fn} failed: {status}")
+        res = res["data"]
+    return calldata.decode(bytes.fromhex(res.removeprefix("0x")))
+
+
 def failure_detail(receipt) -> str:
     """Why a write failed, from the fields that actually carry it.
 
@@ -145,18 +296,6 @@ def failure_detail(receipt) -> str:
     if stderr:
         parts.append(f"stderr={str(stderr)[:300]}")
     return "  ".join(parts)
-
-
-def succeeded(receipt) -> bool:
-    """`execution_result == SUCCESS`, and nothing weaker.
-
-    ACCEPTED and FINALIZED are lifecycle states, not success: a reverted call
-    finalizes too, with every validator agreeing about the error, so a vote
-    count alone looks healthy. Same check `gltest.assertions` makes, inlined so
-    the agents do not import the test harness.
-    """
-    lr = (receipt.get("consensus_data") or {}).get("leader_receipt") or []
-    return bool(lr) and lr[0].get("execution_result") == "SUCCESS"
 
 
 class Notch:

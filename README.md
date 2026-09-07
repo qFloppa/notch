@@ -9,13 +9,31 @@ See [`docs/spec.md`](docs/spec.md) for the full spec.
 
 ## Deployed
 
-| Network | Address |
-|---|---|
-| studionet | `0x266a61216466477ADF4dcFdAd09972Eb64DaCEd8` |
+| Network | Address | Source deployed |
+|---|---|---|
+| studionet (interactive demo) | `0x266a61216466477ADF4dcFdAd09972Eb64DaCEd8` | full, 68,837 B |
+| Testnet Bradbury / Asimov | `0xf0610384850FE66E2Ee05200D4Af4E30d67746Db` | comments stripped, 39,838 B |
 
-Deployed with `bond_atto = 1 GEN`, `dispute_window_seconds = 3600`,
-`base_credit_atto = 10 USDC`. Testnet Bradbury is not yet deployed — it needs a
-faucet-funded key, unlike gasless studionet.
+Both with `bond_atto = 1 GEN`, `dispute_window_seconds = 3600`,
+`base_credit_atto = 10 USDC`, all three read back from the chain after deploy.
+[Bradbury explorer](https://explorer-bradbury.genlayer.com/address/0xf0610384850FE66E2Ee05200D4Af4E30d67746Db).
+
+Two things about the testnet deployment, stated because they are real
+qualifications rather than footnotes:
+
+- **Bradbury and Asimov are the same chain.** Both report chain id 4221 and
+  return an *identical block hash* at the same height, so one deploy covers both
+  names.
+- **The testnet copy has its `#` comments stripped**, because the full source
+  does not fit. Bradbury is a ZK rollup with a per-block pubdata budget measured
+  at **~53 KB**, and the contract is 68,837 bytes — `eth_estimateGas` refuses
+  with `BlockPubdataLimitReached` on every attempt. Removing comments (24,923
+  bytes) gets it to 39,838. **Every docstring is kept**, so the deployed module
+  still carries its reasoning, and the transform is deterministic — regenerate it
+  from the repo with `agents/common.py:testnet_source()` and diff. Behaviour is
+  identical, not assumed: the stripped build lints to the same
+  `Methods: 21 (13 view, 8 write)` and passes all 110 direct-mode tests.
+  `contracts/notch.py` itself is untouched.
 
 ## Quickstart
 
@@ -97,14 +115,30 @@ is the one with real spread: the same code path took 141s and then 26s, so treat
 it as "tens of seconds to a couple of minutes" rather than a number to plan
 against. (Task 8's real-model integration test saw ~250s on a heavier prompt.)
 
-`agents/seller.py --calls 200` is the plan's full scale and works, but it is
-~43 minutes of billing. The default is 25. The claim does not rest on the count:
-one statement, one hash and one ruling cover the cycle whether that is 25 calls
-or ten thousand — the number only changes how long you wait to watch it.
+`agents/seller.py --calls 200` is the plan's full scale, but **it will not finish
+in one run**: studionet allows 60 req/min, **1000 req/hour** and 10,000/day, and
+each notch costs about seven requests (one submit, four or five receipt polls,
+one resumability read). That is ~1,400 requests over ~43 minutes, so the *hourly*
+limit is reached around notch 140 and further calls are rejected with `-32429`
+until the window resets. The default is 25 (~175 requests). Both agents are
+resumable, so a 200-notch run is two passes an hour apart rather than one long
+one.
+
+The claim does not rest on the count: one statement, one hash and one ruling cover
+the cycle whether that is 25 calls or ten thousand — the number only changes how
+long you wait to watch it.
 
 Both agents are **resumable**. studionet drops a connection occasionally, and
 `add_notch` refuses a duplicate id, so a rerun skips what it already billed
 rather than dying on `duplicate notch`.
+
+To deploy to the public testnet instead:
+
+```bash
+# fund an address first -- https://testnet-faucet.genlayer.foundation/
+# (100 GEN per 24h, browser only: it is behind Cloudflare Turnstile)
+.venv/Scripts/python.exe deploy/deploy.py --network bradbury
+```
 
 ## Verify a statement yourself
 
