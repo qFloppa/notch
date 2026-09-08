@@ -1,0 +1,141 @@
+[
+  {
+    "name": "demo:0 -- live on studionet, 25 notches, one leg above 2^53",
+    "tab_id": "demo",
+    "cycle": 0,
+    "notch_ids": [
+      "demo-c0-n0",
+      "demo-c0-n1",
+      "demo-c0-n2",
+      "demo-c0-n3",
+      "demo-c0-n4",
+      "demo-c0-n5",
+      "demo-c0-n6",
+      "demo-c0-n7",
+      "demo-c0-n8",
+      "demo-c0-n9",
+      "demo-c0-n10",
+      "demo-c0-n11",
+      "demo-c0-n12",
+      "demo-c0-n13",
+      "demo-c0-n14",
+      "demo-c0-n15",
+      "demo-c0-n16",
+      "demo-c0-n17",
+      "demo-c0-n18",
+      "demo-c0-n19",
+      "demo-c0-n20",
+      "demo-c0-n21",
+      "demo-c0-n22",
+      "demo-c0-n23",
+      "demo-c0-n24"
+    ],
+    "legs": [
+      {
+        "debtor": "0xEfBe9329E126Ed967bc7d1356dDf9A39136E6bc7",
+        "creditor": "0xDBB2BaD01dd981fdFA7bfcF6C1f6b0E0EA38cbe5",
+        "atto": "125000000000000000"
+      }
+    ],
+    "statement_hash": "dd5ae0c99df1f208ce688c055579ae7722e4c4292c74bf94849395428a583740",
+    "verified_on_chain": true
+  },
+  {
+    "name": "demo:1 -- live on studionet, cycle 1, so `cycle` is exercised",
+    "tab_id": "demo",
+    "cycle": 1,
+    "notch_ids": [
+      "demo-c1-n0",
+      "demo-c1-n1",
+      "demo-c1-n2",
+      "demo-c1-n3",
+      "demo-c1-n4",
+      "demo-c1-n5",
+      "demo-c1-n6",
+      "demo-c1-n7",
+      "demo-c1-n8",
+      "demo-c1-n9",
+      "demo-c1-n10",
+      "demo-c1-n11"
+    ],
+    "legs": [
+      {
+        "debtor": "0xEfBe9329E126Ed967bc7d1356dDf9A39136E6bc7",
+        "creditor": "0xDBB2BaD01dd981fdFA7bfcF6C1f6b0E0EA38cbe5",
+        "atto": "60000000000000000"
+      }
+    ],
+    "statement_hash": "a2b93f8b56b10d11e4f8d86c03dfcb4516830bae83acc04c1207a851abe3d3d9",
+    "verified_on_chain": true
+  },
+  {
+    "name": "multilateral -- two legs, pins leg ordering",
+    "tab_id": "tri",
+    "cycle": 4,
+    "notch_ids": [
+      "tri-n0",
+      "tri-n1",
+      "tri-n2"
+    ],
+    "legs": [
+      {
+        "debtor": "0x1111111111111111111111111111111111111111",
+        "creditor": "0xDBB2BaD01dd981fdFA7bfcF6C1f6b0E0EA38cbe5",
+        "atto": "35000000000000000"
+      },
+      {
+        "debtor": "0xEfBe9329E126Ed967bc7d1356dDf9A39136E6bc7",
+        "creditor": "0xDBB2BaD01dd981fdFA7bfcF6C1f6b0E0EA38cbe5",
+        "atto": "15000000000000000"
+      }
+    ],
+    "statement_hash": "906f2ef814c73e5740213abe9d76c2d1020c20900fb60a56d634880b90cf1191",
+    "verified_on_chain": false
+  },
+  {
+    "name": "non-smooth atto -- Number() would silently drop the last digit",
+    "tab_id": "odd",
+    "cycle": 0,
+    "notch_ids": [
+      "odd-n0",
+      "odd-n1"
+    ],
+    "legs": [
+      {
+        "debtor": "0xEfBe9329E126Ed967bc7d1356dDf9A39136E6bc7",
+        "creditor": "0xDBB2BaD01dd981fdFA7bfcF6C1f6b0E0EA38cbe5",
+        "atto": "125000000000000001"
+      }
+    ],
+    "statement_hash": "1718cc253aafb1beeac8bca94309a85e29989eeb99a08f0098e13a7d816caa1c",
+    "verified_on_chain": false
+  },
+  {
+    "name": "lexicographic ids -- n10 sorts before n2",
+    "tab_id": "lex",
+    "cycle": 0,
+    "notch_ids": [
+      "lex-n0",
+      "lex-n1",
+      "lex-n2",
+      "lex-n3",
+      "lex-n4",
+      "lex-n5",
+      "lex-n6",
+      "lex-n7",
+      "lex-n8",
+      "lex-n9",
+      "lex-n10",
+      "lex-n11"
+    ],
+    "legs": [
+      {
+        "debtor": "0xEfBe9329E126Ed967bc7d1356dDf9A39136E6bc7",
+        "creditor": "0xDBB2BaD01dd981fdFA7bfcF6C1f6b0E0EA38cbe5",
+        "atto": "60000000000000000"
+      }
+    ],
+    "statement_hash": "2c5cd3331c0e475b4475036ac1cc330fafd2d3bec75d45fba471b88b62d61e1e",
+    "verified_on_chain": false
+  }
+]
