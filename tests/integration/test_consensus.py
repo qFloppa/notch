@@ -39,7 +39,7 @@ from gltest.accounts import get_accounts
 from gltest.assertions import tx_execution_succeeded
 
 PINNED_SHA = "5ca4883e28b2b2798ffa6a66e9138b56b02aae44"
-RAW_BASE = f"https://raw.githubusercontent.com/qFloppa/notch/{PINNED_SHA}/fixtures"
+RAW_BASE = f"https://raw.githubusercontent.com/Rat3dRR/notch/{PINNED_SHA}/fixtures"
 
 GOOD_URL = f"{RAW_BASE}/receipt-good.json"
 # Verified live: 200, 142 bytes, this digest.

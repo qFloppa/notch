@@ -38,7 +38,7 @@ PINNED_SHA = "5ca4883e28b2b2798ffa6a66e9138b56b02aae44"
 # and never depends on what the bytes are. That is deliberate: the assertion
 # survives the fixture changing, and `tests/integration/test_consensus.py` is
 # where the fixture's exact digest is pinned and guarded.
-EVIDENCE_URL = (f"https://raw.githubusercontent.com/qFloppa/notch/{PINNED_SHA}"
+EVIDENCE_URL = (f"https://raw.githubusercontent.com/Rat3dRR/notch/{PINNED_SHA}"
                 f"/fixtures/receipt-good.json")
 WRONG_HASH = "0" * 64
 

@@ -35,8 +35,22 @@ CONTRACT = REPO / "contracts" / "notch.py"
 # SHA and never a branch: a branch URL serves whatever the file becomes, and the
 # hash committed on-chain would drift out from under the evidence check. Verified
 # live at this SHA: 200, 142b and 220b, digests matching the local bytes.
+#
+# THIS REPO MUST STAY PUBLIC, and that is not a preference. A private repo makes
+# these URLs return 404, validators read that as spec 5.2 "unreachable", and
+# `_leader` rules `upheld` with `evidence_hash_matched: False` and no model
+# consulted -- for every notch ever billed, since the URI is committed in
+# storage and cannot be rewritten. It looks like the contract working (it is;
+# that path is correct) while the adjudication half of the demo is silently
+# dead. Observed on 2026-09-08: every dispute short-circuited until the repo was
+# made public again.
+#
+# The SHA is content-addressed, so the same commit exists under any fork or
+# mirror of this history and serves identical bytes. Verified 200 with matching
+# digests under both `Rat3dRR` and `qFloppa`, which is the cheap redundancy:
+# point this at whichever stays public.
 PINNED_SHA = "c3e34324a53f2a9a5ab9566c72b12e5a079f108e"
-RAW_BASE = f"https://raw.githubusercontent.com/qFloppa/notch/{PINNED_SHA}/fixtures"
+RAW_BASE = f"https://raw.githubusercontent.com/Rat3dRR/notch/{PINNED_SHA}/fixtures"
 
 # 0.005 USDC per call at atto scale, the plan's figure.
 ATTO_PER_CALL = 5 * 10**15

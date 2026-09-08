@@ -28,7 +28,7 @@ import {
   read,
   submit,
   withLock,
-} from "./chain";
+} from "./chain.ts";
 
 /** Closed in the contract, so closed here: `contracts/notch.py:20`. */
 export const CLAIM_KINDS = [
@@ -53,9 +53,22 @@ const CLAIM_MAX = 500;
  * Both fixtures are pinned to a **commit** SHA, never a branch: a branch URL
  * serves whatever the file becomes, and the digest committed on-chain would
  * drift out from under the evidence check. Same SHA the demo agents use.
+ *
+ * **The repo behind this URL must stay public**, and that is load-bearing rather
+ * than tidy. A private repo makes these return 404; validators read a 404 as
+ * §5.2 "unreachable"; `_leader` then rules `upheld` with
+ * `evidence_hash_matched: false` and **no model consulted** — for every notch
+ * ever billed, because the URI lives in contract storage and cannot be
+ * rewritten. The demo still appears to work, minus the half that adjudicates.
+ * Observed: every dispute short-circuited until the repo was made public.
+ *
+ * A git SHA is content-addressed, so this commit exists under any mirror of the
+ * history and serves identical bytes — verified 200 with matching digests under
+ * both `Rat3dRR` and `qFloppa`. That is the cheap redundancy if visibility ever
+ * changes again.
  */
 const PINNED_SHA = "c3e34324a53f2a9a5ab9566c72b12e5a079f108e";
-const RAW = `https://raw.githubusercontent.com/qFloppa/notch/${PINNED_SHA}/fixtures`;
+const RAW = `https://raw.githubusercontent.com/Rat3dRR/notch/${PINNED_SHA}/fixtures`;
 
 const GOOD_DIGEST = "93503ef3a142b813240a27b12ff8d79165f95cdd15ef38eda147140953b24a6a";
 const OFF_SPEC_DIGEST = "23a84981fbe59fc3cf1a0f58e1310d29a05cf777b2973c41c457320b2ce690b9";
